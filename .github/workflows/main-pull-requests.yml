@@ -1,0 +1,37 @@
+# Pull requests into main come only from the maintainers' dev branch: main
+# receives dev at release time. Any other pull request into main is closed
+# with a pointer to dev. The job runs this repository's code, never the pull
+# request's, and reads the fields a contributor controls from the environment.
+name: Main pull requests
+
+on:
+  pull_request_target:
+    types: [opened, reopened, edited]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  from-dev:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Close unless it is the maintainers' dev branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          # A failed lookup fails the job (bash -e) rather than closing a
+          # maintainer's pull request.
+          PERMISSION=$(gh api "repos/$GH_REPO/collaborators/$AUTHOR/permission" --jq .permission)
+          if [ "$HEAD_REPO" = "$GH_REPO" ] && [ "$HEAD_REF" = dev ] && [ "$PERMISSION" = admin ]; then
+            echo "A maintainer's pull request from dev."
+            exit 0
+          fi
+          gh pr close "$NUMBER" --comment "Pull requests are opened against \`dev\`: \`main\` receives \`dev\` at release time. Please open this change against \`dev\` (see CONTRIBUTING.md)."

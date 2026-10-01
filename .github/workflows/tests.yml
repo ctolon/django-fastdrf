@@ -1,0 +1,108 @@
+name: Tests
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_COLOR: '1'
+
+jobs:
+  approval:
+    # A pull request that the maintainer did not open and push waits for the
+    # maintainer's approval of the `pull-request-ci` environment before any
+    # job runs its code.
+    if: >-
+      github.event_name == 'pull_request' &&
+      (github.event.pull_request.user.login != 'ctolon' || github.actor != 'ctolon')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: pull-request-ci
+    steps:
+      - run: echo "Approved by a maintainer."
+
+  quality:
+    needs: approval
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: '0.12.13'
+      - run: uv sync --locked --python 3.14 --group dev
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pytest --cov=fastdrf --cov-branch --cov-fail-under=90
+
+  matrix:
+    needs: approval
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.12', '3.13', '3.14']
+        pair: ['django5.2-drf3.16', 'django5.2-drf3.17', 'django5.2-drf3.18', 'django6.0-drf3.17', 'django6.0-drf3.18', 'django6.1-drf3.18']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: '0.12.13'
+      - run: uv python install "$TEST_PYTHON"
+        env:
+          TEST_PYTHON: ${{ matrix.python }}
+      - run: uv run --locked nox -s "tests-$TEST_PYTHON($TEST_PAIR)"
+        env:
+          TEST_PYTHON: ${{ matrix.python }}
+          TEST_PAIR: ${{ matrix.pair }}
+
+  sessions:
+    # Free-threaded CPython, the declared minimum versions, no optional
+    # extras, and DRF against fastdrf's opt-ins on every Django/DRF pair.
+    needs: approval
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: '0.12.13'
+      - run: uv python install 3.12 3.14 3.14t
+      - run: uv run --locked nox -s freethreaded tests_minimum tests_without_extras differential
+
+  package:
+    needs: approval
+    if: ${{ !failure() && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: '0.12.13'
+      - run: uv build
+      - run: uvx twine check --strict dist/*
+      - name: Install the wheel alone and import every module
+        run: uv run --no-project --isolated --python 3.14 --with dist/*.whl python tools/check_wheel.py

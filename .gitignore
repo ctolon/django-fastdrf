@@ -1,0 +1,11 @@
+.venv/
+.nox/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+.coverage*
+htmlcov/
+dist/
+build/
+.local/

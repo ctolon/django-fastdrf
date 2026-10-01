@@ -1,0 +1,72 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "django-fastdrf"
+version = "0.1.0"
+description = "Opt-in serializer and query optimizations for synchronous Django REST framework."
+readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.12"
+authors = [{ name = "Cevat Batuhan Tolon" }]
+keywords = ["django", "django-rest-framework", "serializers", "performance", "msgspec"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Web Environment",
+  "Framework :: Django",
+  "Framework :: Django :: 5.2",
+  "Framework :: Django :: 6.0",
+  "Framework :: Django :: 6.1",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: Free Threading :: 2 - Beta",
+  "Topic :: Internet :: WWW/HTTP",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Typing :: Typed",
+]
+dependencies = ["django>=5.2", "djangorestframework>=3.16"]
+
+[project.urls]
+Homepage = "https://github.com/ctolon/django-fastdrf"
+Documentation = "https://github.com/ctolon/django-fastdrf/tree/main/docs"
+Changelog = "https://github.com/ctolon/django-fastdrf/blob/main/CHANGELOG.md"
+Issues = "https://github.com/ctolon/django-fastdrf/issues"
+Source = "https://github.com/ctolon/django-fastdrf"
+
+[project.optional-dependencies]
+msgspec = ["msgspec>=0.19"]
+pydantic = ["pydantic>=2.9"]
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-django>=4.9", "hypothesis>=6", "pytest-cov>=6", "ruff>=0.13", "msgspec>=0.19", "pydantic>=2.9", "django-filter>=25.1", "build>=1.2", "nox>=2024.10"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fastdrf"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/tests", "/docs", "/tools", "/noxfile.py", "/pyproject.toml", "/uv.lock", "/*.md", "/LICENSE", "/NOTICE"]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "tests.settings"
+pythonpath = [".", "src"]
+testpaths = ["tests"]
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "DJ"]
+ignore = ["E501", "B904"]
+
+[tool.coverage.run]
+branch = true
+source = ["fastdrf"]
