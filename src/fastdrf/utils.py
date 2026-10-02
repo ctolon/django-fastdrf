@@ -1,6 +1,7 @@
 """Conservative hook inspection and bounded class-keyed optimization caches."""
 
 import functools
+import importlib
 import inspect
 import threading
 import weakref
@@ -8,7 +9,13 @@ import weakref
 from django.db import models
 from django.db.models import fields as model_fields
 from django.db.models import manager, query_utils
-from django.db.models.fields import files, related, related_descriptors, reverse_related
+from django.db.models.fields import (
+    files,
+    json,
+    related,
+    related_descriptors,
+    reverse_related,
+)
 from rest_framework import fields, relations, serializers
 
 __all__ = [
@@ -31,6 +38,7 @@ for _module in (
     query_utils,
     model_fields,
     files,
+    json,
     related,
     related_descriptors,
     reverse_related,
@@ -42,6 +50,41 @@ for _module in (
         value for value in vars(_module).values() if issubclass(type(value), type)
     )
 del _module
+try:
+    from django.db.models.fields import composite
+except ImportError:  # Django < 5.2
+    pass
+else:
+    _DEFAULTS.update(
+        value for value in vars(composite).values() if issubclass(type(value), type)
+    )
+
+# Modules of Django's contrib applications that define model fields: they
+# import models, so their classes are registered once the application
+# registry is ready, for the applications installed.
+_CONTRIB_MODULES = {
+    "django.contrib.contenttypes": ("django.contrib.contenttypes.fields",),
+}
+_contrib_registered = False
+
+
+def _register_contrib():
+    global _contrib_registered
+    from django.apps import apps
+
+    if not apps.ready:
+        return
+    _contrib_registered = True
+    for app, modules in _CONTRIB_MODULES.items():
+        if apps.is_installed(app):
+            for name in modules:
+                module = importlib.import_module(name)
+                _DEFAULTS.update(
+                    value
+                    for value in vars(module).values()
+                    if issubclass(type(value), type) and value.__module__ == name
+                )
+    _clear_dependents()
 
 
 # Per decorated function. Weak keys alone cannot collect a class captured by
@@ -162,6 +205,8 @@ def framework_base(cls):
 
 
 def is_framework_class(cls):
+    if not _contrib_registered:
+        _register_contrib()
     return cls in _DEFAULTS
 
 

@@ -88,6 +88,12 @@ Changes follow these rules:
 User-visible changes update the documentation in `docs/` and the unreleased
 section at the top of `CHANGELOG.md`.
 
+Code that repeats a DRF function step by step (the compiled representations,
+the input recognizers, the kept JSON encoder) is listed in
+`tests/test_upstream_mirrors.py` with a digest of the DRF function for each
+supported DRF version. When a DRF release changes one, the test names the
+counterpart to read again; bring it in line, then add the new digest.
+
 ## Pull requests
 
 - Open pull requests against the `dev` branch. `main` receives `dev` at

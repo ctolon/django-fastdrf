@@ -85,7 +85,7 @@ bounds, patterns, choices, `allow_null`, constant defaults, `required=False`
 (`T | None = None` with a comment for pydantic, `msgspec.UNSET` for
 msgspec) and wire names (`source=`). Nothing else is guessed: such a field
 becomes `Any` (or `serializers.JSONField()`) with a
-`# TODO(fastdrf_convert): ...` comment saying what was not converted. The
+`# TODO(convert): ...` comment saying what was not converted. The
 same comments list `validate_<field>()`, `validate()`, validators beyond
 those a field's options build (explicit `validators=`, model validators, the
 unique validators `ModelSerializer` derives), pydantic validators,

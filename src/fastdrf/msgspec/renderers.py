@@ -68,14 +68,19 @@ class MsgspecJSONRenderer(JSONRenderer):
             return JSONRenderer.render(
                 self, data, accepted_media_type, renderer_context
             )
-        if b"NaN" in output or b"Infinity" in output:
+        # A one-byte search is memchr, far cheaper than a longer needle on a
+        # large body: look for the first letter before the word.
+        if (b"N" in output and b"NaN" in output) or (
+            b"I" in output and b"Infinity" in output
+        ):
             # A non-finite Decimal, which msgspec writes as a bare token that
             # no JSON parser reads, or the words inside a string: DRF's
             # error, or DRF's bytes.
             return JSONRenderer.render(
                 self, data, accepted_media_type, renderer_context
             )
-        if b"\xe2\x80" in output:
+        # U+2028 and U+2029 are E2 80 A8 and E2 80 A9 in UTF-8.
+        if b"\xe2" in output and b"\xe2\x80" in output:
             # Escape the separators DRF escapes so the output can be embedded
             # in JavaScript.
             output = output.replace(b"\xe2\x80\xa8", b"\\u2028").replace(

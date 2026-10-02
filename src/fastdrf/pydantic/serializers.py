@@ -130,6 +130,10 @@ class PydanticBackend:
     def __init__(self, *, context: Any = None) -> None:
         self.context = context
 
+    def validate(self, schema: Any, data: Any, *, partial: bool, strict: bool) -> Any:
+        """``validated_data`` of ``data``: the field values of a loaded ``schema``."""
+        return self.values(self.load(schema, data, strict=strict), partial=partial)
+
     def load(self, schema: Any, data: Any, *, strict: bool) -> Any:
         try:
             return schema.model_validate(
@@ -247,6 +251,20 @@ class PydanticBackend:
                     names.add(name)
         return names
 
+    def json_schema(
+        self, schema: Any, *, ref_prefix: str, direction: str
+    ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+        """
+        The JSON Schema of ``schema`` and of the models it refers to, which
+        refer to each other through ``ref_prefix`` (an OpenAPI generator's
+        components): its validation schema for a ``"request"``, its
+        serialization schema (serialization aliases) for a ``"response"``.
+        """
+        mode = "validation" if direction == "request" else "serialization"
+        body = schema.model_json_schema(ref_template=ref_prefix + "{model}", mode=mode)
+        components = body.pop("$defs", {})
+        return body, components
+
     def field_specs(self, schema: Any) -> list[FieldSpec]:
         return [
             FieldSpec(
@@ -334,8 +352,11 @@ def serializer_for(
     schema: object,
     output_schema: type | None = None,
     model: type[Model] | None = None,
+    *,
+    base: type | None = None,
 ) -> type | None:
     """A ``PydanticSerializer`` for a model (or an input and an output model)."""
     if not (isinstance(schema, type) and issubclass(schema, pydantic.BaseModel)):
         return None
-    return build_serializer(PydanticSerializer, schema, output_schema, model)
+    # ``base``: a package's subclass of PydanticSerializer (aiodrf's is asynchronous).
+    return build_serializer(base or PydanticSerializer, schema, output_schema, model)

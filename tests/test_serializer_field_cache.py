@@ -672,3 +672,55 @@ def test_every_list_of_field_building_hooks_includes_drfs():
 
     assert set(_FIELD_HOOKS) <= set(_BUILD_HOOKS)
     assert set(_FIELD_HOOKS) <= _FIELD_STATE
+
+
+def test_another_frameworks_model_serializer_builds_its_template():
+    # A package that registers its own ModelSerializer base (aiodrf) uses the
+    # same template: DRF's ``get_fields``, not fastdrf's class in the MRO.
+    from fastdrf._field_cache import _field_template
+    from fastdrf.utils import framework_base
+
+    @framework_base
+    class OtherModelSerializer(drf_serializers.ModelSerializer):
+        pass
+
+    class Authors(OtherModelSerializer):
+        class Meta:
+            model = Author
+            fields = ["id", "name"]
+
+    template = _field_template(Authors)
+    assert list(template) == ["id", "name"]
+    assert {name: repr(field) for name, field in template.items()} == {
+        name: repr(field) for name, field in Authors().get_fields().items()
+    }
+
+
+@isolate_apps("tests")
+def test_contenttypes_generic_relations_are_djangos_code():
+    from django.contrib.contenttypes.fields import GenericForeignKey, GenericRelation
+    from django.contrib.contenttypes.models import ContentType
+
+    class Note(models.Model):
+        content_type = models.ForeignKey(ContentType, models.CASCADE)
+        object_id = models.PositiveIntegerField()
+        target = GenericForeignKey("content_type", "object_id")
+
+        class Meta:
+            app_label = "tests"
+
+        def __str__(self):
+            return str(self.pk)
+
+    class Card(models.Model):
+        title = models.CharField(max_length=20)
+        notes = GenericRelation(Note)
+
+        class Meta:
+            app_label = "tests"
+
+        def __str__(self):
+            return str(self.pk)
+
+    assert not _model_fields_call_code(Note)
+    assert not _model_fields_call_code(Card)

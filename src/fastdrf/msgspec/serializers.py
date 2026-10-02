@@ -58,9 +58,15 @@ class MsgspecBackend:
         *,
         dec_hook: Callable[[type, Any], Any] | None = None,
         enc_hook: Callable[[Any], Any] | None = None,
+        schema_hook: Callable[[type], dict[str, Any]] | None = None,
     ) -> None:
         self.dec_hook = dec_hook
         self.enc_hook = enc_hook
+        self.schema_hook = schema_hook
+
+    def validate(self, schema: Any, data: Any, *, partial: bool, strict: bool) -> Any:
+        """``validated_data`` of ``data``: the field values of a loaded ``schema``."""
+        return self.values(self.load(schema, data, strict=strict), partial=partial)
 
     def load(self, schema: Any, data: Any, *, strict: bool) -> Any:
         try:
@@ -170,6 +176,21 @@ class MsgspecBackend:
             for field in _struct_info(schema).fields
             if isinstance(_unwrap(field.type), collections)
         }
+
+    def json_schema(
+        self, schema: Any, *, ref_prefix: str, direction: str
+    ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+        """
+        The JSON Schema of ``schema`` and of the schemas it refers to, which
+        refer to each other through ``ref_prefix`` (an OpenAPI generator's
+        components). A Struct is described alike for requests and responses.
+        """
+        (ref,), components = msgspec.json.schema_components(
+            (schema,), ref_template=ref_prefix + "{name}", schema_hook=self.schema_hook
+        )
+        name = ref["$ref"].rsplit("/", 1)[-1]
+        body = components.pop(name)
+        return body, components
 
     def field_specs(self, schema: Any) -> list[FieldSpec]:
         return [_field_spec(field) for field in _struct_info(schema).fields]
@@ -338,8 +359,9 @@ class MsgspecSerializer(SchemaSerializer):
     ``Meta.strict = False`` to accept strings for numbers and booleans in
     JSON input, like DRF does.
 
-    ``Meta.dec_hook`` and ``Meta.enc_hook`` convert custom types for
-    validation and representation.
+    ``Meta.dec_hook``, ``Meta.enc_hook`` and ``Meta.schema_hook`` handle
+    custom types for validation, representation and the JSON Schema
+    (``backend.json_schema``) respectively.
     """
 
     schema_library = "msgspec"
@@ -350,6 +372,7 @@ class MsgspecSerializer(SchemaSerializer):
         return MsgspecBackend(
             dec_hook=getattr(meta, "dec_hook", None),
             enc_hook=getattr(meta, "enc_hook", None),
+            schema_hook=getattr(meta, "schema_hook", None),
         )
 
 
@@ -357,8 +380,11 @@ def serializer_for(
     schema: object,
     output_schema: type | None = None,
     model: type[Model] | None = None,
+    *,
+    base: type | None = None,
 ) -> type | None:
     """A ``MsgspecSerializer`` for a Struct (or an input and an output Struct)."""
     if not (isinstance(schema, type) and issubclass(schema, msgspec.Struct)):
         return None
-    return build_serializer(MsgspecSerializer, schema, output_schema, model)
+    # ``base``: a package's subclass of MsgspecSerializer (aiodrf's is asynchronous).
+    return build_serializer(base or MsgspecSerializer, schema, output_schema, model)
