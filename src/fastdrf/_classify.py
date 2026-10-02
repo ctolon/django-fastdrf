@@ -4,6 +4,7 @@ import inspect
 import weakref
 from inspect import iscoroutinefunction
 
+from django.core.exceptions import FieldDoesNotExist
 from django.db import models
 from django.utils.choices import CallableChoiceIterator
 from rest_framework import fields, relations, serializers
@@ -62,84 +63,102 @@ _DRF_SHADOWS = frozenset({"_creation_counter", "initial", "default_empty_html"})
 # again from their arguments; these hooks could make the copy differ.
 _BUILD_HOOKS = (*_FIELD_HOOKS, "bind", "__deepcopy__", "__new__")
 
-# class -> the names an instance must not shadow, or None when it is not static
-_static_classes: weakref.WeakKeyDictionary[type, frozenset[str] | None] = (
-    weakref.WeakKeyDictionary()
-)
-depends_on_classification(_static_classes)
 
-
-def is_static(serializer):
+class _StaticClasses:
     """
-    Return True if the fields of ``serializer`` (the child of a list
-    serializer), and those of the serializers nested in it, are a function
-    of its class.
-
-    That holds for an instance built with the usual arguments only that
-    shadows nothing of its class (no fields materialized, no method assigned),
-    of a class that builds its fields with DRF's code alone from declarations
-    and a model, whose declared fields are DRF's, children included, and
-    whose declared serializers are static too. The compiler, the input
-    recognizer and the classification below keep per-class answers for these
-    alone.
+    :func:`is_static` and the per-class answers it keeps, for one rule of
+    which hooks are the project's (``user_defines``): fastdrf's, or that of a
+    package built on it whose own bases count as framework code (aiodrf's).
     """
-    if isinstance(serializer, serializers.ListSerializer):
-        serializer = serializer.child
-    names = _instance_shadow_names(type(serializer))
-    return (
-        names is not None
-        and _PLAIN_KWARGS.issuperset(serializer._kwargs)
-        and names.isdisjoint(vars(serializer))
-    )
 
+    def __init__(self, user_defines):
+        self.user_defines = user_defines
+        # class -> the names an instance must not shadow, or None when it is
+        # not static
+        self.classes = weakref.WeakKeyDictionary()
 
-def _instance_shadow_names(cls):
-    """
-    The names an instance of ``cls`` must not set for its fields to be those
-    of its class (:func:`is_static`), or None when they never are.
-    """
-    try:
-        return _static_classes[cls]
-    except KeyError:
-        pass
-    meta = getattr(cls, "Meta", None)
-    model = getattr(meta, "model", None)
-    static = (
-        issubclass(cls, serializers.Serializer)
-        # A child may build fields from its parent's context, or change them
-        # when bound.
-        and not getattr(meta, "depth", 0)
-        and not user_defines(cls, *_BUILD_HOOKS)
-        # The project's code, run whenever a ModelSerializer builds its fields.
-        and not (
-            issubclass(cls, serializers.ModelSerializer)
-            and model is not None
-            and _model_fields_call_code(model)
+    def is_static(self, serializer):
+        """
+        Return True if the fields of ``serializer`` (the child of a list
+        serializer), and those of the serializers nested in it, are a
+        function of its class.
+
+        That holds for an instance built with the usual arguments only that
+        shadows nothing of its class (no fields materialized, no method
+        assigned), of a class that builds its fields with DRF's code alone
+        from declarations and a model, whose declared fields are DRF's,
+        children included, and whose declared serializers are static too.
+        The compiler, the input recognizer and the classification below keep
+        per-class answers for these alone.
+        """
+        if isinstance(serializer, serializers.ListSerializer):
+            serializer = serializer.child
+        names = self.shadow_names(type(serializer))
+        return (
+            names is not None
+            and _PLAIN_KWARGS.issuperset(serializer._kwargs)
+            and names.isdisjoint(vars(serializer))
         )
-        and all(_static_declaration(field) for field in cls._declared_fields.values())
-    )
-    names = frozenset(dir(cls)) - _DRF_SHADOWS if static else None
-    # Racing threads store the same value.
-    return _static_classes.setdefault(cls, names)
+
+    def shadow_names(self, cls):
+        """
+        The names an instance of ``cls`` must not set for its fields to be
+        those of its class (:func:`is_static`), or None when they never are.
+        """
+        try:
+            return self.classes[cls]
+        except KeyError:
+            pass
+        meta = getattr(cls, "Meta", None)
+        model = getattr(meta, "model", None)
+        static = (
+            issubclass(cls, serializers.Serializer)
+            # A child may build fields from its parent's context, or change
+            # them when bound.
+            and not getattr(meta, "depth", 0)
+            and not self.user_defines(cls, *_BUILD_HOOKS)
+            # The project's code, run whenever a ModelSerializer builds its
+            # fields.
+            and not (
+                issubclass(cls, serializers.ModelSerializer)
+                and model is not None
+                and _model_fields_call_code(model)
+            )
+            and all(
+                self.static_declaration(field)
+                for field in cls._declared_fields.values()
+            )
+        )
+        names = frozenset(dir(cls)) - _DRF_SHADOWS if static else None
+        # Racing threads store the same value.
+        return self.classes.setdefault(cls, names)
+
+    def static_declaration(self, field):
+        if isinstance(field, serializers.ListSerializer):
+            return not self.user_defines(
+                field, *_BUILD_HOOKS
+            ) and self.static_declaration(field.child)
+        if isinstance(field, serializers.BaseSerializer):
+            return self.shadow_names(type(field)) is not None
+        # DRF's own fields; a custom one may bind differently per parent.
+        # DRF's collections and to-many relations bind the child they were
+        # declared with.
+        return type(field) in _BUILTIN_FIELDS and all(
+            self.static_declaration(child)
+            for child in (
+                getattr(field, "child", None),
+                getattr(field, "child_relation", None),
+            )
+            if child is not None
+        )
 
 
-def _static_declaration(field):
-    if isinstance(field, serializers.ListSerializer):
-        return not user_defines(field, *_BUILD_HOOKS) and _static_declaration(
-            field.child
-        )
-    if isinstance(field, serializers.BaseSerializer):
-        return _instance_shadow_names(type(field)) is not None
-    # DRF's own fields; a custom one may bind differently per parent. DRF's
-    # collections and to-many relations bind the child they were declared with.
-    return type(field) in _BUILTIN_FIELDS and all(
-        _static_declaration(child)
-        for child in (
-            getattr(field, "child", None),
-            getattr(field, "child_relation", None),
-        )
-        if child is not None
-    )
+_statics = _StaticClasses(user_defines)
+depends_on_classification(_statics.classes)
+_static_classes = _statics.classes
+is_static = _statics.is_static
+_instance_shadow_names = _statics.shadow_names
+_static_declaration = _statics.static_declaration
 
 
 # What DRF materializes on an instance the first time it is read. Once any of
@@ -195,16 +214,79 @@ def has_async_representation(serializer):
 
 def _async_representation(serializer):
     if isinstance(serializer, serializers.ListSerializer):
-        return has_async_representation(serializer.child)
+        # The list's own hooks first: they represent the children.
+        return (
+            iscoroutinefunction(type(serializer).to_representation)
+            or user_defines(serializer, "ato_representation", "adata")
+            or has_async_representation(serializer.child)
+        )
     if not isinstance(serializer, serializers.Serializer):
         return iscoroutinefunction(type(serializer).to_representation)
     if iscoroutinefunction(
         getattr(type(serializer), "to_representation", None)
     ) or user_defines(serializer, "ato_representation", "adata"):
         return True
+    model = getattr(getattr(serializer, "Meta", None), "model", None)
     return any(
-        has_async_representation(field)
-        if isinstance(field, serializers.BaseSerializer)
-        else iscoroutinefunction(type(field).to_representation)
-        for field in serializer.fields.values()
+        _async_field(serializer, field, model) for field in serializer.fields.values()
     )
+
+
+def _async_field(serializer, field, model):
+    if isinstance(field, serializers.BaseSerializer):
+        return has_async_representation(field)
+    if iscoroutinefunction(type(field).to_representation):
+        return True
+    if isinstance(field, fields.SerializerMethodField):
+        # DRF calls ``get_<field>``: a coroutine function gives a coroutine.
+        return _returns_coroutine(getattr(serializer, field.method_name, None))
+    return _async_source(model, getattr(field, "source_attrs", ()))
+
+
+def _returns_coroutine(function):
+    """
+    Whether calling ``function`` gives a coroutine: a coroutine function, or
+    one behind wrappers that keep ``__wrapped__`` (``functools.wraps``).
+    """
+    if function is None:
+        return False
+    if iscoroutinefunction(function):
+        return True
+    try:
+        return iscoroutinefunction(inspect.unwrap(function))
+    except ValueError:  # a ``__wrapped__`` cycle
+        return False
+
+
+def _async_source(model, source_attrs):
+    """Whether ``source_attrs`` read from ``model`` end at a coroutine function."""
+    if model is None or not source_attrs:
+        return False
+    for name in source_attrs[:-1]:
+        model = _related_model(model, name)
+        if model is None:
+            return False
+    return _async_attribute(model, source_attrs[-1])
+
+
+@class_cache
+def _related_model(model, name):
+    # The model a forward relation such as ``book`` in ``book.title`` leads to.
+    try:
+        field = model._meta.get_field(name)
+    except FieldDoesNotExist:
+        return None
+    return field.related_model if field.many_to_one or field.one_to_one else None
+
+
+@class_cache
+def _async_attribute(model, name):
+    try:
+        attribute = inspect.getattr_static(model, name)
+    except AttributeError:
+        return False
+    if isinstance(attribute, property):
+        attribute = attribute.fget
+    elif isinstance(attribute, (staticmethod, classmethod)):
+        attribute = attribute.__func__
+    return attribute is not None and _returns_coroutine(attribute)

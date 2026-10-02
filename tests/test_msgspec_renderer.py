@@ -145,3 +145,19 @@ def test_a_get_indent_of_the_projects_is_asked():
     instance = MsgspecJSONRenderer()
     instance.get_indent = lambda accepted_media_type, renderer_context: 2
     assert instance.render({"a": 1}, "application/json", {}) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "em dash \u2014, ellipsis \u2026, euro \u20ac, arrow \u2192",
+        "\u2028at the start",
+        "at the end\u2029",
+        "mixed \u2014 and \u2028 and \u2026 and \u2029",
+        "Istanbul, Nairobi, INFO, None, Inf",
+    ],
+    ids=repr,
+)
+def test_text_around_the_escaped_separators_is_drfs(text):
+    data = {"text": text, "items": [text, {"nested": text}]}
+    assert MsgspecJSONRenderer().render(data) == JSONRenderer().render(data)

@@ -86,7 +86,7 @@ _CONSTANTS = (type(None), bool, int, float, str)
 # Unsupported constants are always declined; their identity is not metadata.
 # In particular, a callable limit may close over a serializer or request.
 _UNSUPPORTED_CONSTANT = object()
-_PLAIN_INPUT_TYPES = (*_CONSTANTS, datetime.date, datetime.time, uuid.UUID)
+_PLAIN_INPUT_TYPES = frozenset((*_CONSTANTS, datetime.date, datetime.time, uuid.UUID))
 _SURROGATES = re.compile("[\ud800-\udfff]")
 
 
@@ -331,7 +331,8 @@ def _char(field: Any, label: str, backend: str) -> tuple[Any, Callable[[Any], An
         # characters such as ``\\x1f``) and rejects NUL and surrogates.
         if trim and value != value.strip():
             return NOT_RECOGNIZED
-        if "\x00" in value or _SURROGATES.search(value):
+        # An ASCII string has no surrogates, and ``isascii()`` reads a flag.
+        if "\x00" in value or (not value.isascii() and _SURROGATES.search(value)):
             return NOT_RECOGNIZED
         if min_length is not None and len(value) < min_length:
             return NOT_RECOGNIZED
@@ -458,22 +459,30 @@ def _collection(
     is_list = type(field) is fields.ListField
     container = list[child_type] if is_list else dict[str, child_type]  # type: ignore[valid-type]  # built at runtime
 
-    def finish(items: Any) -> Any:
-        result: Any = [] if is_list else {}
-        for key, item in enumerate(items) if is_list else items.items():
-            value = (
-                finish_child(item)
-                if item is not None and finish_child is not None
-                else item
-            )
-            if value is NOT_RECOGNIZED:
-                return NOT_RECOGNIZED
-            if is_list:
-                result.append(value)
-            else:
-                result[key] = value
+    # One function per shape: these run for every item of every request.
+    def finish_list(items: Any) -> Any:
+        result = []
+        for item in items:
+            value = item
+            if item is not None and finish_child is not None:
+                value = finish_child(item)
+                if value is NOT_RECOGNIZED:
+                    return NOT_RECOGNIZED
+            result.append(value)
         return result
 
+    def finish_dict(items: Any) -> Any:
+        result = {}
+        for key, item in items.items():
+            value = item
+            if item is not None and finish_child is not None:
+                value = finish_child(item)
+                if value is NOT_RECOGNIZED:
+                    return NOT_RECOGNIZED
+            result[key] = value
+        return result
+
+    finish = finish_list if is_list else finish_dict
     return _constrained(container, arguments, backend), finish
 
 
@@ -544,8 +553,18 @@ def _finish_with(spec: InputSpec, backend: str) -> Callable[[Any], Any]:
 
         unset = UNSET
 
+    # Resolved once: ``finish`` runs for every row of every request.
+    # ``skip`` is ``Field.validate_empty_values``: absent input is skipped in
+    # partial updates and without a default.
     bindings = tuple(
-        (f"field_{index}" if backend == "pydantic" else field.name, field)
+        (
+            f"field_{index}" if backend == "pydantic" else field.name,
+            spec.partial or field.default is fields.empty,
+            field.default,
+            field.finish,
+            field.source_attrs[0] if len(field.source_attrs) == 1 else None,
+            field.source_attrs,
+        )
         for index, field in enumerate(spec.fields)
     )
 
@@ -553,23 +572,21 @@ def _finish_with(spec: InputSpec, backend: str) -> Callable[[Any], Any]:
         if obj is None:
             return None
         ret = {}
-        for name, field in bindings:
+        for name, skip, default, finish_value, key, source_attrs in bindings:
             value = getattr(obj, name)
             if value is unset:
-                # ``Field.validate_empty_values``: absent input is skipped
-                # in partial updates and without a default.
-                if spec.partial or field.default is fields.empty:
+                if skip:
                     continue
-                value = field.default
-            elif value is not None and field.finish is not None:
-                value = field.finish(value)
+                value = default
+            elif value is not None and finish_value is not None:
+                value = finish_value(value)
                 if value is NOT_RECOGNIZED:
                     return NOT_RECOGNIZED
-            if len(field.source_attrs) == 1:
-                ret[field.source_attrs[0]] = value
+            if key is not None:
+                ret[key] = value
             else:
                 # DRF's ``set_value`` does not use ``self``.
-                set_value(None, ret, field.source_attrs, value)  # type: ignore[arg-type]
+                set_value(None, ret, source_attrs, value)  # type: ignore[arg-type]
         return ret
 
     return finish
@@ -656,15 +673,21 @@ def _plain_input(value: Any) -> bool:
     # nested serializer requires a mapping. Do not let a backend's richer
     # Python-object protocol widen the accepted input or call user code.
     kind = type(value)
-    if kind in _PLAIN_INPUT_TYPES:
+    if kind is dict:
+        for key, item in value.items():
+            if type(key) is not str:
+                return False
+            # Leaves are checked here: a call per value would cost more
+            # than the check.
+            if type(item) not in _PLAIN_INPUT_TYPES and not _plain_input(item):
+                return False
         return True
     if kind is list:
-        return all(_plain_input(item) for item in value)
-    if kind is dict:
-        return all(
-            type(key) is str and _plain_input(item) for key, item in value.items()
-        )
-    return False
+        for item in value:
+            if type(item) not in _PLAIN_INPUT_TYPES and not _plain_input(item):
+                return False
+        return True
+    return kind in _PLAIN_INPUT_TYPES
 
 
 # -- Cache --------------------------------------------------------------------------

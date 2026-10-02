@@ -25,6 +25,15 @@ Framework code is identified by class, never by module name. A hook counts
 as the framework's when Django's or DRF's own classes define it, or a class
 registered with `fastdrf.utils.framework_base`. A hook defined by a project
 class anywhere in the MRO, or set on an instance, counts as the project's.
+The fields of `django.contrib.contenttypes` are registered once the
+application registry is ready, when the application is installed.
+
+A package can build on these optimizations with its own serializer bases
+(aiodrf does): it registers its bases with `framework_base`, so that their
+hooks count as the framework's. Register only bases whose hooks give DRF's
+result; a base whose representation differs (a schema serializer's, a list
+serializer that awaits) stays unregistered and keeps its serializers on its
+own code.
 
 The package is synchronous. No ORM call becomes asynchronous, and Django's
 thread and transaction model is unchanged.

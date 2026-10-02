@@ -1,7 +1,5 @@
 """DRF serializers with explicit, independent input/output and copy policies."""
 
-import copy
-
 from rest_framework import serializers as drf
 from rest_framework.serializers import (  # noqa: F401 -- DRF-compatible public field imports
     BooleanField,
@@ -41,17 +39,8 @@ from rest_framework.serializers import (  # noqa: F401 -- DRF-compatible public 
     UUIDField,
     ValidationError,
 )
-from rest_framework.settings import api_settings
 
-from fastdrf._field_cache import (
-    _compiled_field_copy_plan,
-    _declared_copy_plan,
-    _field_copy_plan,
-    _field_template,
-    _static_fields,
-    _template_memo,
-)
-from fastdrf._field_options import field_options
+from fastdrf._field_cache import _model_serializer_fields, _serializer_fields
 from fastdrf._relations import _batch_related_lookups, _unbatch
 from fastdrf.settings import fastdrf_settings
 from fastdrf.utils import framework_base
@@ -195,32 +184,13 @@ class BaseSerializer(BackendMixin, drf.BaseSerializer):
 @framework_base
 class Serializer(BaseSerializer, drf.Serializer):
     def get_fields(self):
-        enabled, mode = field_options(self)
-        if (
-            not isinstance(self, drf.ModelSerializer)
-            and enabled
-            and mode == "compiled"
-            and "_declared_fields" not in vars(self)
-        ):
-            return _declared_copy_plan(type(self))()
-        return super().get_fields()
+        return _serializer_fields(self, super().get_fields)
 
 
 @framework_base
 class ModelSerializer(Serializer, drf.ModelSerializer):
     def get_fields(self):
-        enabled, mode = field_options(self)
-        if not (enabled and _static_fields(self)):
-            return super().get_fields()
-        if self.url_field_name is None:
-            self.url_field_name = api_settings.URL_FIELD_NAME
-        if mode == "compiled":
-            return _compiled_field_copy_plan(type(self))()
-        if mode == "clone":
-            return _field_copy_plan(type(self))()
-        return copy.deepcopy(
-            _field_template(type(self)), dict(_template_memo(type(self)))
-        )
+        return _model_serializer_fields(self, super().get_fields)
 
 
 @framework_base

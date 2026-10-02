@@ -165,3 +165,119 @@ def test_a_coroutine_hook_of_a_field_class_is_still_found():
     assert has_async_representation(Names(many=True))
     assert has_async_representation(Static())
     assert has_async_representation(Static())
+
+
+def test_a_list_serializers_own_coroutine_hooks_are_found():
+    class Names(drf_serializers.ModelSerializer):
+        class Meta:
+            model = Author
+            fields = ["id", "name"]
+
+    class AsyncList(drf_serializers.ListSerializer):
+        async def to_representation(self, data):
+            return []
+
+    class AsyncHooks(drf_serializers.ListSerializer):
+        async def ato_representation(self, data):
+            return []
+
+    class AsyncData(drf_serializers.ListSerializer):
+        async def adata(self):
+            return []
+
+    assert not has_async_representation(Names(many=True))
+    for list_class in (AsyncList, AsyncHooks, AsyncData):
+        serializer = list_class(child=Names())
+        assert has_async_representation(serializer), list_class.__name__
+
+
+def test_coroutine_methods_and_async_model_attributes_are_found():
+    class Shouted(drf_serializers.ModelSerializer):
+        shout = drf_serializers.SerializerMethodField()
+
+        class Meta:
+            model = Author
+            fields = ["id", "shout"]
+
+        async def get_shout(self, author):
+            return author.name.upper()
+
+    class Plain(drf_serializers.ModelSerializer):
+        shout = drf_serializers.SerializerMethodField()
+
+        class Meta:
+            model = Author
+            fields = ["id", "shout"]
+
+        def get_shout(self, author):
+            return author.name.upper()
+
+    assert has_async_representation(Shouted())
+    assert has_async_representation(Shouted(many=True))
+    assert not has_async_representation(Plain())
+
+
+@isolate_apps("tests")
+def test_an_async_model_attribute_read_by_a_field_is_found():
+    class Shelf(models.Model):
+        name = models.CharField(max_length=20)
+
+        class Meta:
+            app_label = "tests"
+
+        def __str__(self):
+            return self.name
+
+        @property
+        async def label(self):
+            return self.name
+
+        async def count(self):
+            return 1
+
+    class Labels(drf_serializers.ModelSerializer):
+        label = drf_serializers.CharField(read_only=True)
+
+        class Meta:
+            model = Shelf
+            fields = ["id", "label"]
+
+    class Counts(drf_serializers.ModelSerializer):
+        count = drf_serializers.IntegerField(read_only=True)
+
+        class Meta:
+            model = Shelf
+            fields = ["id", "count"]
+
+    class Names(drf_serializers.ModelSerializer):
+        class Meta:
+            model = Shelf
+            fields = ["id", "name"]
+
+    assert has_async_representation(Labels())
+    assert has_async_representation(Counts())
+    assert not has_async_representation(Names())
+
+
+def test_a_coroutine_function_behind_a_wrapper_is_found():
+    import functools
+
+    def logged(function):
+        @functools.wraps(function)
+        def wrapper(*args, **kwargs):
+            return function(*args, **kwargs)
+
+        return wrapper
+
+    async def get_shout(self, author):
+        return author.name.upper()
+
+    class Shouted(drf_serializers.ModelSerializer):
+        shout = drf_serializers.SerializerMethodField()
+
+        class Meta:
+            model = Author
+            fields = ["id", "shout"]
+
+    Shouted.get_shout = logged(get_shout)
+    assert has_async_representation(Shouted())

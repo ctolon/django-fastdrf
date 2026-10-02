@@ -67,17 +67,28 @@ def check_serializer_backends(app_configs, **kwargs):
     # also views built before the setting changed.
     from fastdrf.typed import SchemaViewMixin, static_serializer
 
+    return _view_errors(
+        _url_views(SchemaViewMixin), static_serializer, check_id="fastdrf.E005"
+    )
+
+
+def _view_errors(views, check, check_id):
+    """
+    An error for each ``(view_class, initkwargs)`` of ``views`` (once per
+    class and arguments) that ``check(view_class, initkwargs)`` refuses with
+    ``ImproperlyConfigured``.
+    """
     errors = []
     seen = set()
-    for view_class, initkwargs in _url_views(SchemaViewMixin):
+    for view_class, initkwargs in views:
         key = (view_class, repr(sorted(initkwargs.items(), key=lambda item: item[0])))
         if key in seen:
             continue
         seen.add(key)
         try:
-            static_serializer(view_class, initkwargs)
+            check(view_class, initkwargs)
         except ImproperlyConfigured as exc:
-            errors.append(Error(str(exc), obj=view_class, id="fastdrf.E005"))
+            errors.append(Error(str(exc), obj=view_class, id=check_id))
     return errors
 
 

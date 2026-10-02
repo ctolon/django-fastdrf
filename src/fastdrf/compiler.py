@@ -66,6 +66,7 @@ import threading
 import typing
 import uuid
 import weakref
+import zoneinfo
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import GetSetDescriptorType
@@ -1103,6 +1104,33 @@ def _in_call(dump: Callable[[Any], Any]) -> Callable[..., Any]:
 
 _WHOLE_MINUTE = datetime.timedelta(minutes=1)
 
+# The time zones whose methods run no project code.
+_LIBRARY_ZONES = frozenset((type(None), datetime.timezone, zoneinfo.ZoneInfo))
+
+
+# A converter may also convert a whole column (``column``), with the call
+# state read once. ``accepts`` tells, without running project code, whether
+# the column holds only values whose conversion runs none either; the
+# caller converts row by row otherwise, in DRF's order.
+_DECIMALS = frozenset((type(None), decimal.Decimal))
+_DATETIMES = frozenset((type(None), datetime.datetime))
+_TZINFO = operator.attrgetter("tzinfo")
+
+
+def _decimal_column(values: list[Any]) -> bool:
+    # ``str()`` of anything but a Decimal may run project code.
+    return set(map(type, values)) <= _DECIMALS
+
+
+def _datetime_column(values: list[Any]) -> bool:
+    # So may another value's, or another time zone's, methods. Datetimes are
+    # truthy: ``filter`` drops the Nones.
+    return (
+        set(map(type, values)) <= _DATETIMES
+        and set(map(type, map(_TZINFO, filter(None, values)))) <= _LIBRARY_ZONES
+        and type(_call().zone()) in _LIBRARY_ZONES
+    )
+
 
 def _decimal_representation(field: Any) -> Callable[[Any], Any]:
     """
@@ -1127,15 +1155,25 @@ def _decimal_representation(field: Any) -> Callable[[Any], Any]:
     # ``Decimal(".1") ** places``, whose exponent is all quantize() reads.
     exponent = None if places is None else decimal.Decimal(1).scaleb(-places)
 
-    def represent(value: Any) -> Any:
+    def represent(value: Any, context: Any = None) -> Any:
         if not isinstance(value, decimal.Decimal):
             value = decimal.Decimal(str(value).strip())
         if exponent is not None:
-            value = value.quantize(exponent, context=_call().context(digits, rounding))
+            if context is None:
+                context = _call().context(digits, rounding)
+            value = value.quantize(exponent, context=context)
         if normalize:
             value = value.normalize()
         return f"{value:f}"
 
+    def represent_column(values: list[Any]) -> list[Any]:
+        context = _call().context(digits, rounding)
+        return [
+            None if value is None else represent(value, context) for value in values
+        ]
+
+    represent.accepts = _decimal_column  # type: ignore[attr-defined]
+    represent.column = represent_column  # type: ignore[attr-defined]
     return represent
 
 
@@ -1155,11 +1193,12 @@ def _datetime_representation(field: Any) -> Callable[[Any], Any]:
         drf.format = output_format
     drf_representation = drf.to_representation
 
-    def represent(value: Any) -> Any:
+    def represent(value: Any, zone: Any = _ABSENT) -> Any:
         if type(value) is not datetime.datetime:
             return drf_representation(value)
         offset = value.utcoffset()
-        zone = _call().zone()
+        if zone is _ABSENT:
+            zone = _call().zone()
         if offset is None or zone is None:
             return (
                 value if offset is None and zone is None else drf_representation(value)
@@ -1172,6 +1211,12 @@ def _datetime_representation(field: Any) -> Callable[[Any], Any]:
             offset = value.utcoffset()
         return drf_representation(value) if offset % _WHOLE_MINUTE else value
 
+    def represent_column(values: list[Any]) -> list[Any]:
+        zone = _call().zone()
+        return [None if value is None else represent(value, zone) for value in values]
+
+    represent.accepts = _datetime_column  # type: ignore[attr-defined]
+    represent.column = represent_column  # type: ignore[attr-defined]
     return represent
 
 

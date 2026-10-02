@@ -63,6 +63,14 @@ def _unchanged[T](value: T) -> T:
     return value
 
 
+def _any_values(values: list[typing.Any]) -> bool:
+    return True
+
+
+_unchanged.accepts = _any_values  # type: ignore[attr-defined]
+_unchanged.column = list  # type: ignore[attr-defined]
+
+
 def struct_for(spec: OutputSpec) -> typing.Any:
     """A ``Struct`` reading ``spec``'s attributes and emitting DRF's keys."""
     fields: list[tuple[typing.Any, ...]] = []
@@ -171,16 +179,19 @@ def _complete(values: Sequence[typing.Any], plan: _Plan) -> None:
         _check_strings(values, strings)
     if not (converters or later):
         return
+    if converters:
+        if len(values) < _COLUMN_ROWS:
+            _complete_rows(values, converters, None)
+        else:
+            # Every value is read before any is converted: several fields
+            # may share a value.
+            columns = [
+                [getattr(value, source) for value in values]
+                for _, source, _ in converters
+            ]
+            if not _complete_columns(values, converters, columns):
+                _complete_rows(values, converters, zip(*columns, strict=True))
     for value in values:
-        if converters:
-            # Read before any is converted: several fields may share a value.
-            read = [getattr(value, source) for _, source, _ in converters]
-            try:
-                for (name, _, convert), item in zip(converters, read, strict=True):
-                    # DRF represents None as None without asking the field.
-                    setattr(value, name, None if item is None else convert(item))
-            except UnreadableValue as exc:
-                raise msgspec.ValidationError(str(exc)) from exc
         for attribute, kind, schema, child_plan in later:
             item = getattr(value, attribute)
             if item is None:
@@ -198,6 +209,59 @@ def _complete(values: Sequence[typing.Any], plan: _Plan) -> None:
                 setattr(value, attribute, item)
             if child_plan:
                 _complete((item,), child_plan)
+
+
+# Below this many rows, setting up the columns costs more than converting
+# row by row saves (measured: 5 rows slower, 8 even, 12 and more faster).
+_COLUMN_ROWS = 8
+
+
+def _complete_rows(
+    values: Sequence[typing.Any],
+    converters: tuple[tuple[str, str, typing.Any], ...],
+    rows: typing.Any,
+) -> None:
+    """Convert row by row, in DRF's order, from ``rows`` if already read."""
+    for value in values:
+        # Read before any is converted: several fields may share a value.
+        read = (
+            [getattr(value, source) for _, source, _ in converters]
+            if rows is None
+            else next(rows)
+        )
+        try:
+            for (name, _, convert), item in zip(converters, read, strict=True):
+                # DRF represents None as None without asking the field.
+                setattr(value, name, None if item is None else convert(item))
+        except UnreadableValue as exc:
+            raise msgspec.ValidationError(str(exc)) from exc
+
+
+def _complete_columns(
+    values: Sequence[typing.Any],
+    converters: tuple[tuple[str, str, typing.Any], ...],
+    columns: list[list[typing.Any]],
+) -> bool:
+    """
+    Convert column by column when every converter accepts its column (see
+    ``accepts`` in the compiler), and tell whether it did. Nothing is
+    converted unless every column is accepted, and nothing is written unless
+    every column is converted: otherwise the caller converts row by row, in
+    DRF's order, which raises DRF's first error.
+    """
+    if not all(hasattr(convert, "column") for _, _, convert in converters):
+        return False
+    pairs = list(zip(converters, columns, strict=True))
+    if not all(convert.accepts(column) for (_, _, convert), column in pairs):
+        return False
+    try:
+        converted = [convert.column(column) for (_, _, convert), column in pairs]
+    except Exception:  # noqa: BLE001 -- the row-by-row conversion raises DRF's error
+        return False
+    for (name, _, _), column in zip(converters, converted, strict=True):
+        for value, item in zip(values, column, strict=True):
+            setattr(value, name, item)
+    return True
 
 
 def build(spec: OutputSpec) -> Encoder:
