@@ -14,6 +14,10 @@ hooks for that step are the project's:
 - ``DataResponseMixin``: resolves :class:`fastdrf.response.DataResponse` and
   answers with :class:`fastdrf.response.Response`;
 - ``DispatchOptimizationMixin``: the three together.
+
+The mixins are described in comments, not docstrings: drf-spectacular
+describes an operation with the first docstring of the view's classes
+before DRF's, and would publish a mixin's for every view without its own.
 """
 
 import threading
@@ -56,9 +60,8 @@ __all__ = [
 ]
 
 
+# Place before DRF's GenericAPIView or ModelViewSet; all methods stay sync.
 class QueryOptimizationMixin:
-    """Place before DRF's GenericAPIView or ModelViewSet; all methods stay sync."""
-
     serializer_field_cache = None
     serializer_field_copy_mode = None
 
@@ -168,19 +171,16 @@ _FRAMEWORK_REQUESTS = frozenset({DRFRequest})
 _LAZY_GET = (ASGIRequest.__dict__["GET"], WSGIRequest.__dict__["GET"])
 
 
+# DRF's ``perform_content_negotiation``, kept between requests.
+#
+# What DRF's negotiation selects depends on the ``Accept`` header, the
+# format asked for (suffix or query parameter) and the media types and
+# formats of the view's renderers only; it is kept as the renderer's
+# position and the accepted media type, and each request gets the renderer
+# instances of its own. Failures (406, or 404 for an unknown format) are
+# not kept.
 @framework_base
 class NegotiationCacheMixin:
-    """
-    DRF's ``perform_content_negotiation``, kept between requests.
-
-    What DRF's negotiation selects depends on the ``Accept`` header, the
-    format asked for (suffix or query parameter) and the media types and
-    formats of the view's renderers only; it is kept as the renderer's
-    position and the accepted media type, and each request gets the renderer
-    instances of its own. Failures (406, or 404 for an unknown format) are
-    not kept.
-    """
-
     def perform_content_negotiation(self, request, force=False):
         if not _framework_only(self, _NEGOTIATION_HOOKS):
             return super().perform_content_negotiation(request, force)
@@ -295,20 +295,17 @@ _HEADER_HOOKS = (
 )
 
 
+# DRF's ``initialize_request`` without calling the hooks it calls, and
+# DRF's ``default_response_headers`` with the ``Allow`` value of the view's
+# class worked out once.
+#
+# Each applies while the hooks of its step are DRF's and Django's (checked
+# against the class once, against the instance on every request); the
+# view's ``parser_classes``, ``authentication_classes``,
+# ``content_negotiation_class`` and ``renderer_classes`` are read on every
+# request, as DRF reads them.
 @framework_base
 class RequestPlanMixin:
-    """
-    DRF's ``initialize_request`` without calling the hooks it calls, and
-    DRF's ``default_response_headers`` with the ``Allow`` value of the view's
-    class worked out once.
-
-    Each applies while the hooks of its step are DRF's and Django's (checked
-    against the class once, against the instance on every request); the
-    view's ``parser_classes``, ``authentication_classes``,
-    ``content_negotiation_class`` and ``renderer_classes`` are read on every
-    request, as DRF reads them.
-    """
-
     def initialize_request(self, request, *args, **kwargs):
         viewset = _initialize_plan(type(self))
         if viewset is None or not self.__dict__.keys().isdisjoint(_INITIALIZE_HOOKS):
@@ -410,16 +407,13 @@ def _headers_plan(view_class):
 # -- Responses --------------------------------------------------------------------
 
 
+# ``finalize_response`` that resolves a :class:`~fastdrf.response.DataResponse`
+# and gives DRF's ``Response`` the class of
+# :class:`fastdrf.response.Response`, which releases the request objects
+# when the server closes it. A subclass of DRF's ``Response`` keeps its
+# class.
 @framework_base
 class DataResponseMixin:
-    """
-    ``finalize_response`` that resolves a :class:`~fastdrf.response.DataResponse`
-    and gives DRF's ``Response`` the class of
-    :class:`fastdrf.response.Response`, which releases the request objects
-    when the server closes it. A subclass of DRF's ``Response`` keeps its
-    class.
-    """
-
     def finalize_response(self, request, response, *args, **kwargs):
         if isinstance(response, DataResponse) and response.renderer_context is None:
             if _framework_only(self, ("finalize_response",)):
@@ -434,12 +428,11 @@ class DataResponseMixin:
         return super().finalize_response(request, response, *args, **kwargs)
 
 
+# The dispatch steps of :class:`NegotiationCacheMixin`,
+# :class:`RequestPlanMixin` and :class:`DataResponseMixin`. Place it first,
+# before DRF's view, generic view or viewset.
 @framework_base
 class DispatchOptimizationMixin(
     DataResponseMixin, NegotiationCacheMixin, RequestPlanMixin
 ):
-    """
-    The dispatch steps of :class:`NegotiationCacheMixin`,
-    :class:`RequestPlanMixin` and :class:`DataResponseMixin`. Place it first,
-    before DRF's view, generic view or viewset.
-    """
+    pass

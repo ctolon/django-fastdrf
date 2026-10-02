@@ -185,7 +185,25 @@ pydantic model is described with its validation schema for a `"request"`
 and its serialization schema (serialization aliases) for a `"response"`; a
 Struct alike for both.
 
-## Not included
+## OpenAPI (drf-spectacular)
 
-There is no drf-spectacular extension for schema serializers: an OpenAPI
-generator can use `backend.json_schema()`.
+With drf-spectacular installed (`pip install django-fastdrf[spectacular]`)
+and `"fastdrf"` in `INSTALLED_APPS`, the OpenAPI document describes a schema
+serializer from its schema classes (`fastdrf.spectacular`): request bodies
+from the input schema, responses from the output schema, with their
+constraints, nested classes (as components) and enums. A pydantic model whose
+validation and serialization differ (aliases, computed fields) has a separate
+`<Name>Request` component; a PATCH body requires nothing, or is
+`Meta.partial_schema` when one is set. `Meta.ref_name` names the component.
+Both OpenAPI 3.0 (drf-spectacular's default; `nullable` instead of a `null`
+type) and 3.1 are written.
+
+Without the application, drf-spectacular reads the serializer's synthetic
+fields, which carry no types, constraints or nested classes: every field is
+documented as a read-only string and request bodies are empty. DRF's own
+serializers, compiled or not, need nothing: drf-spectacular reads their
+fields as usual.
+
+fastdrf's view mixins have no docstrings (their descriptions are comments),
+so a view without a docstring of its own has no description in the
+document; drf-spectacular takes the first docstring among a view's classes.

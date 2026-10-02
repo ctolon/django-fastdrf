@@ -606,27 +606,27 @@ def raise_validation_error(
     raise ValidationError(detail)
 
 
+# A comment, not a docstring: drf-spectacular would publish it as the
+# description of every view without one of its own.
+#
+# Use msgspec Structs or pydantic models as a view's serializer::
+#
+#     class BookViewSet(SchemaViewMixin, viewsets.ModelViewSet):
+#         queryset = Book.objects.all()
+#         input_schema = BookIn  # validates request bodies
+#         output_schema = BookOut  # represents responses
+#
+# Either schema alone does both. Without either, a bare schema class set
+# as ``serializer_class`` (or returned by ``get_serializer_class()``) is
+# wrapped with :func:`adapt`. The serializer is resolved and checked
+# against ``FASTDRF["ALLOWED_SERIALIZER_BACKENDS"]`` when the URL is built
+# (``as_view()``), and a serializer chosen per request when the view builds
+# it. In a generic view the pair writes ``queryset.model`` and
+# ``serializer.validated_object`` is the ``input_schema`` instance. In any
+# view, ``get_validated_body()`` returns the request body as an
+# ``input_schema`` instance and ``schema_response()`` represents data with
+# ``output_schema``.
 class SchemaViewMixin:
-    """
-    Use msgspec Structs or pydantic models as a view's serializer::
-
-        class BookViewSet(SchemaViewMixin, viewsets.ModelViewSet):
-            queryset = Book.objects.all()
-            input_schema = BookIn  # validates request bodies
-            output_schema = BookOut  # represents responses
-
-    Either schema alone does both. Without either, a bare schema class set
-    as ``serializer_class`` (or returned by ``get_serializer_class()``) is
-    wrapped with :func:`adapt`. The serializer is resolved and checked
-    against ``FASTDRF["ALLOWED_SERIALIZER_BACKENDS"]`` when the URL is built
-    (``as_view()``), and a serializer chosen per request when the view builds
-    it. In a generic view the pair writes ``queryset.model`` and
-    ``serializer.validated_object`` is the ``input_schema`` instance. In any
-    view, ``get_validated_body()`` returns the request body as an
-    ``input_schema`` instance and ``schema_response()`` represents data with
-    ``output_schema``.
-    """
-
     input_schema: type | None = None
     output_schema: type | None = None
     # Set by the view this is mixed into.
