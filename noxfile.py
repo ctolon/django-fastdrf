@@ -18,7 +18,7 @@ PAIRS = [
 def tests(session, django, drf):
     session.install(
         "-e",
-        ".[msgspec,pydantic]",
+        ".[msgspec,pydantic,spectacular]",
         f"django~={django}.0",
         f"djangorestframework~={drf}.0",
         "pytest",
@@ -34,7 +34,7 @@ def tests(session, django, drf):
 def freethreaded(session):
     session.install(
         "-e",
-        ".[msgspec,pydantic]",
+        ".[msgspec,pydantic,spectacular]",
         "django~=6.1.0",
         "djangorestframework~=3.18.0",
         "pytest",
@@ -59,7 +59,7 @@ def differential(session, django, drf):
     """The same requests to DRF's viewsets and to fastdrf's opt-ins, compared."""
     session.install(
         "-e",
-        ".[msgspec,pydantic]",
+        ".[msgspec,pydantic,spectacular]",
         f"django~={django}.0",
         f"djangorestframework~={drf}.0",
         "pytest",
@@ -73,7 +73,7 @@ def differential(session, django, drf):
 
 @nox.session(python="3.12")
 def tests_minimum(session):
-    """The declared minimum versions: Django, DRF, msgspec and pydantic floors."""
+    """The declared minimum versions: Django, DRF, msgspec, pydantic and drf-spectacular floors."""
     session.install(
         "-e",
         ".",
@@ -81,6 +81,7 @@ def tests_minimum(session):
         "djangorestframework==3.16.0",
         "msgspec==0.19.0",
         "pydantic==2.9.0",
+        "drf-spectacular==0.28.0",
         "django-filter==25.1",
         "pytest",
         "pytest-django",
