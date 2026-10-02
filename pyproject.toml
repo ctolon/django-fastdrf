@@ -52,7 +52,7 @@ dev = ["pytest>=8", "pytest-django>=4.9", "hypothesis>=6", "pytest-cov>=6", "ruf
 packages = ["src/fastdrf"]
 
 [tool.hatch.build.targets.sdist]
-include = ["/src", "/tests", "/docs", "/tools", "/noxfile.py", "/pyproject.toml", "/uv.lock", "/*.md", "/LICENSE", "/NOTICE"]
+include = ["/src", "/tests", "/docs", "/tools", "/noxfile.py", "/pyproject.toml", "/*.md", "/LICENSE", "/NOTICE"]
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "tests.settings"
