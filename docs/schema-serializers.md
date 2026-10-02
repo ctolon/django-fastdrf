@@ -36,7 +36,7 @@ class BookSerializer(MsgspecSerializer):
 | `partial_schema` | The schema for `partial=True` input (see [partial updates](#partial-updates)). |
 | `model` | A Django model that `create()` and `update()` write. |
 | `strict` | msgspec: strict by default; `False` accepts `"12"` for an int, as DRF does. pydantic: lax by default; `True` turns on pydantic's strict mode. |
-| `dec_hook`, `enc_hook` | msgspec only: hooks for custom types in validation and output. |
+| `dec_hook`, `enc_hook`, `schema_hook` | msgspec only: hooks for custom types in validation, output and the JSON Schema. |
 
 ## Behaviour
 
@@ -169,7 +169,23 @@ serializers are executed (`SERIALIZER_BACKEND` does).
 of a msgspec Struct or pydantic model for a DRF serializer, and of a DRF
 serializer for a schema.
 
+## JSON Schema
+
+A schema serializer's backend describes its schemas:
+
+```python
+body, components = BookSerializer().backend.json_schema(
+    Book, ref_prefix="#/components/schemas/", direction="response"
+)
+```
+
+`body` is the JSON Schema of the schema class, `components` those of the
+schemas it refers to, which refer to each other through `ref_prefix`. A
+pydantic model is described with its validation schema for a `"request"`
+and its serialization schema (serialization aliases) for a `"response"`; a
+Struct alike for both.
+
 ## Not included
 
-There is no OpenAPI integration for schema serializers: no drf-spectacular
-extension and no msgspec `schema_hook`.
+There is no drf-spectacular extension for schema serializers: an OpenAPI
+generator can use `backend.json_schema()`.

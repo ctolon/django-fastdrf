@@ -124,6 +124,14 @@ class SchemaBackend(Protocol):
 
     def field_specs(self, schema: type) -> Iterable["FieldSpec"]: ...
 
+    def validate(
+        self, schema: type, data: Any, *, partial: bool, strict: bool
+    ) -> Any: ...
+
+    def json_schema(
+        self, schema: type, *, ref_prefix: str, direction: str
+    ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]: ...
+
 
 class SchemaSerializer(drf.Serializer):
     """Base class of ``MsgspecSerializer`` and ``PydanticSerializer``."""
@@ -399,31 +407,50 @@ class BoundedCache:
         return len(self._entries)
 
 
+class _SchemaClasses:
+    """
+    The serializer classes of bare schema classes, one per class (or per
+    input, output and model), built by ``<package>.<library>.serializers``:
+    fastdrf's own, or those of a package whose schema serializers derive from
+    them (aiodrf's are asynchronous). Each package keeps its classes.
+    """
+
+    def __init__(self, package: str) -> None:
+        self.package = package
+        self.cache = BoundedCache(SCHEMA_CACHE_SIZE)
+
+    def adapt(self, schema: type) -> type[SchemaSerializer]:
+        """Return the serializer class for a bare schema class (one per class)."""
+        if not isinstance(schema, type):
+            raise TypeError(f"{schema!r} is not a serializer class.")
+        return self.cache.get(
+            schema, lambda: _serializer_for(schema, None, None, self.package)
+        )
+
+    def schema_serializer(
+        self,
+        input_schema: type,
+        output_schema: type,
+        model: type[models.Model] | None = None,
+    ) -> type[SchemaSerializer]:
+        """
+        The serializer class validating with ``input_schema`` and representing
+        with ``output_schema`` (one class per pair and model). ``model`` is what
+        ``create()`` and ``update()`` write. Both schemas must be of one library.
+        """
+        if input_schema is output_schema and model is None:
+            return self.adapt(input_schema)
+        return self.cache.get(
+            (input_schema, output_schema, model),
+            lambda: _serializer_for(input_schema, output_schema, model, self.package),
+        )
+
+
 # One serializer class per schema, or per (input, output, model).
-_adapted = BoundedCache(SCHEMA_CACHE_SIZE)
-
-
-def adapt(schema: type) -> type[SchemaSerializer]:
-    """Return the serializer class for a bare schema class (one per class)."""
-    if not isinstance(schema, type):
-        raise TypeError(f"{schema!r} is not a serializer class.")
-    return _adapted.get(schema, lambda: _serializer_for(schema, None, None))
-
-
-def schema_serializer(
-    input_schema: type, output_schema: type, model: type[models.Model] | None = None
-) -> type[SchemaSerializer]:
-    """
-    The serializer class validating with ``input_schema`` and representing
-    with ``output_schema`` (one class per pair and model). ``model`` is what
-    ``create()`` and ``update()`` write. Both schemas must be of one library.
-    """
-    if input_schema is output_schema and model is None:
-        return adapt(input_schema)
-    return _adapted.get(
-        (input_schema, output_schema, model),
-        lambda: _serializer_for(input_schema, output_schema, model),
-    )
+_classes = _SchemaClasses("fastdrf")
+_adapted = _classes.cache
+adapt = _classes.adapt
+schema_serializer = _classes.schema_serializer
 
 
 def build_serializer(
@@ -449,7 +476,10 @@ def build_serializer(
 
 
 def _serializer_for(
-    schema: type, output_schema: type | None, model: type[models.Model] | None
+    schema: type,
+    output_schema: type | None,
+    model: type[models.Model] | None,
+    package: str = "fastdrf",
 ) -> type[SchemaSerializer]:
     library = serializer_kind(schema)
     if output_schema is not None and serializer_kind(output_schema) != library:
@@ -460,7 +490,7 @@ def _serializer_for(
     if library == "drf":
         raise TypeError(f"{schema!r} is a serializer already, not a schema class.")
     try:
-        module = importlib.import_module(f"fastdrf.{library}.serializers")
+        module = importlib.import_module(f"{package}.{library}.serializers")
     except ModuleNotFoundError as exc:
         # Only the optional dependency may be missing; anything else is
         # a bug that must not be hidden.
@@ -694,7 +724,10 @@ def _schema_pair(
     )
 
 
-def _resolve(serializer_class: Any, view_class: type) -> type[drf.BaseSerializer]:
+def _resolve(
+    serializer_class: Any, view_class: type, adapt: Callable[[type], type] = adapt
+) -> type[drf.BaseSerializer]:
+    # ``adapt``: a package's, whose schema serializers derive from fastdrf's.
     if not isinstance(serializer_class, type):
         raise ImproperlyConfigured(
             f"{_name(view_class)}'s serializer is {serializer_class!r}, not a class."

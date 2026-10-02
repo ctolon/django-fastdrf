@@ -13,7 +13,6 @@ import weakref
 from django.http import HttpResponse
 from django.template.response import ContentNotRenderedError
 from rest_framework import response
-from rest_framework import views as drf_views
 from rest_framework.serializers import BaseSerializer, ListSerializer
 from rest_framework.utils.serializer_helpers import ReturnDict, ReturnList
 
@@ -211,12 +210,14 @@ def _data_renderer(view, request):
 
 def _framework_finalize(view):
     """Whether ``finalize_response`` is DRF's or a registered framework base's."""
+    # Not imported with this module: ``rest_framework.views`` imports the
+    # policy classes DRF's settings name, which may import this module.
+    from rest_framework.views import APIView
+
     if "finalize_response" in vars(view):
         return False
     owner = definer(type(view), "finalize_response")
-    return owner is drf_views.APIView or (
-        owner is not None and is_framework_class(owner)
-    )
+    return owner is APIView or (owner is not None and is_framework_class(owner))
 
 
 def _render_data(response, view, request, renderer):
@@ -243,8 +244,10 @@ def _render_data(response, view, request, renderer):
     return response
 
 
-def _drf_response(data_response):
-    drf_response = Response(
+def _drf_response(data_response, response_class=None):
+    # ``response_class``: a package's subclass of :class:`Response` (aiodrf's
+    # renders on the event loop).
+    drf_response = (response_class or Response)(
         data_response.data,
         status=data_response.status_code,
         content_type=data_response._explicit_content_type,

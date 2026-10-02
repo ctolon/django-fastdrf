@@ -949,3 +949,44 @@ def test_the_body_is_validated_with_the_views_context():
     )
     assert response.status_code == 200, response.data
     assert response.data == {"name": "n@v"}
+
+
+@pytest.mark.parametrize("library", ["msgspec", "pydantic"])
+def test_the_backend_validates_and_describes_a_schema(library):
+    schema = MsgspecBook if library == "msgspec" else PydanticBook
+    backend = adapt(schema)().backend
+    assert backend.validate(schema, {"title": "T"}, partial=False, strict=True) == {
+        "title": "T",
+        "pages": 100,
+    }
+    with pytest.raises(serializers.ValidationError):
+        backend.validate(schema, {"pages": "x"}, partial=False, strict=True)
+    for direction in ("request", "response"):
+        body, components = backend.json_schema(
+            schema, ref_prefix="#/components/schemas/", direction=direction
+        )
+        assert body["type"] == "object"
+        assert set(body["properties"]) == {"title", "pages"}
+        assert body["required"] == ["title"]
+        assert components == {}
+
+
+class Reference:
+    def __init__(self, key):
+        self.key = key
+
+
+class Referenced(msgspec.Struct):
+    reference: Reference
+
+
+def test_a_msgspec_schema_hook_describes_custom_types():
+    class ReferencedSerializer(MsgspecSerializer):
+        class Meta:
+            schema = Referenced
+            schema_hook = staticmethod(lambda target: {"type": "string"})
+
+    body, _ = ReferencedSerializer().backend.json_schema(
+        Referenced, ref_prefix="#/", direction="request"
+    )
+    assert body["properties"]["reference"] == {"type": "string"}

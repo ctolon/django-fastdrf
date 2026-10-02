@@ -1,13 +1,18 @@
 """Unbound field templates for declarative ModelSerializer subclasses."""
 
+import copy
+
 from django.core.exceptions import FieldDoesNotExist
 from django.core.signals import setting_changed
 from django.db.models.manager import BaseManager
 from django.utils.functional import lazy
+from rest_framework import serializers
+from rest_framework.settings import api_settings
 from rest_framework.utils.field_mapping import get_unique_error_message
 from rest_framework.validators import UniqueValidator
 
 from fastdrf._classify import _model_fields_call_code
+from fastdrf._field_options import field_options
 from fastdrf._inspection import _FIELD_HOOKS
 from fastdrf.utils import class_cache, depends_on_classification, user_defines
 
@@ -52,11 +57,12 @@ def _static_class(cls):
 @class_cache
 def _field_template(cls):
     # Built on an instance of its own: a static class's fields are the same
-    # for every instance, and this one is never bound or handed out.
-    from fastdrf.serializers import ModelSerializer
-
+    # for every instance, and this one is never bound or handed out. DRF's
+    # ``get_fields``: a static class does not override it, and the cached
+    # ``get_fields`` of fastdrf's base (or of a package built on this cache)
+    # is the caller.
     serializer = cls()
-    template = super(ModelSerializer, serializer).get_fields()
+    template = serializers.ModelSerializer.get_fields(serializer)
     model = getattr(getattr(cls, "Meta", None), "model", None)
     if model is not None:
         extra_kwargs = serializer.get_extra_kwargs()
@@ -156,3 +162,43 @@ def _clear_field_templates(*, setting, **kwargs):
 
 
 setting_changed.connect(_clear_field_templates)
+
+
+# ``get_fields`` of the serializer bases built on this cache (fastdrf's, or
+# another package's): ``build`` is the next ``get_fields`` in the MRO, DRF's.
+
+
+def _serializer_fields(serializer, build):
+    """
+    A serializer's fields: a copy plan of its declared fields with
+    ``FIELD_COPY_MODE = "compiled"``, else ``build()``. Model serializers use
+    their own, guarded template (:func:`_model_serializer_fields`).
+    """
+    if not isinstance(serializer, serializers.ModelSerializer):
+        enabled, mode = field_options(serializer)
+        if (
+            enabled
+            and mode == "compiled"
+            and "_declared_fields" not in vars(serializer)
+        ):
+            return _declared_copy_plan(type(serializer))()
+    return build()
+
+
+def _model_serializer_fields(serializer, build):
+    """
+    A model serializer's fields from its class's template (built once) when
+    field caching applies to it, else ``build()``.
+    """
+    enabled, mode = field_options(serializer)
+    if not (enabled and _static_fields(serializer)):
+        return build()
+    if serializer.url_field_name is None:
+        # What DRF's ``get_fields`` sets.
+        serializer.url_field_name = api_settings.URL_FIELD_NAME
+    cls = type(serializer)
+    if mode == "compiled":
+        return _compiled_field_copy_plan(cls)()
+    if mode == "clone":
+        return _field_copy_plan(cls)()
+    return copy.deepcopy(_field_template(cls), dict(_template_memo(cls)))

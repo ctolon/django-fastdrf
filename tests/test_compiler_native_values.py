@@ -140,6 +140,26 @@ def test_digits_beyond_max_digits_fail_as_in_drf(backend):
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
+def test_the_first_failure_in_drfs_order_is_raised(backend):
+    # DRF represents row by row, field by field: the first row's decimal
+    # fails before the second row's datetime overflows the time zone.
+    instances = [
+        Edition(
+            pk=1,
+            published=datetime.datetime(2024, 1, 2, tzinfo=UTC),
+            price=decimal.Decimal("123456.7"),
+        ),
+        Edition(pk=2, published=datetime.datetime.min.replace(tzinfo=UTC), price=1),
+    ]
+    # Enough rows for the column conversion.
+    instances += editions(8, 1)
+    with timezone.override("America/Chicago"):
+        drf = outcome(lambda: Values(instances, many=True).data)
+        assert drf[0] is decimal.InvalidOperation
+        assert compiled(backend, "strict", lambda: Values(instances, many=True)) == drf
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
 def test_rare_values_are_drfs_own_code(backend):
     # Naive values made aware (or refused), offsets in seconds, strings.
     values = [
@@ -206,3 +226,96 @@ def test_one_call_reads_the_zone_and_the_serializer_context_once(backend):
     # Outside a compiled output each value reads its own call state.
     assert compiler._call().serializer_context == {}
     assert compiler._call() is not compiler._call()
+
+
+def test_common_columns_read_the_call_state_once_per_column():
+    instances = editions(50, 3)
+    for instance in instances:
+        instance.price = decimal.Decimal(instance.pk).scaleb(-2)
+    expected = Values(instances, many=True).data
+    calls = mock.Mock(wraps=compiler._call)
+    with mock.patch.object(compiler, "_call", calls):
+        assert compiled("msgspec", "strict", lambda: Values(instances, many=True)) == (
+            expected
+        )
+    # One datetime and four decimal columns, and the datetime column's check
+    # of the time zone: not 250 values.
+    assert calls.call_count == 6
+
+
+class Recorded(datetime.tzinfo):
+    """A project's time zone: its methods are project code."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def utcoffset(self, dt):
+        self.calls += 1
+        return datetime.timedelta(hours=1)
+
+    def dst(self, dt):
+        return datetime.timedelta(0)
+
+    def tzname(self, dt):
+        return "Recorded"
+
+
+class Text(str):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("published", "price"),
+    [
+        (datetime.datetime(2024, 1, 2, tzinfo=Recorded()), decimal.Decimal("1.5")),
+        (datetime.datetime(2024, 1, 2, tzinfo=UTC), Text("1.5")),
+    ],
+    ids=["project time zone", "project string"],
+)
+def test_values_that_may_run_project_code_are_converted_row_by_row(published, price):
+    instances = [
+        Edition(
+            pk=1,
+            published=datetime.datetime(2024, 1, 1, tzinfo=UTC),
+            price=decimal.Decimal(1),
+        ),
+        Edition(pk=2, published=published, price=price),
+    ]
+    # Enough rows for the column conversion, which the second row stops.
+    instances += [
+        Edition(pk=pk, published=instances[0].published, price=decimal.Decimal(pk))
+        for pk in range(3, 11)
+    ]
+    with timezone.override("Europe/Istanbul"):
+        expected = Values(instances, many=True).data
+        calls = mock.Mock(wraps=compiler._call)
+        with mock.patch.object(compiler, "_call", calls):
+            got = compiled("msgspec", "strict", lambda: Values(instances, many=True))
+    assert got == expected
+    # Once per value, and at most once for the datetime column's check of
+    # the time zone: nothing was converted by columns before giving up.
+    assert 10 * 5 <= calls.call_count <= 10 * 5 + 1
+
+
+def test_no_column_is_converted_unless_every_column_is_accepted():
+    from types import SimpleNamespace
+
+    from fastdrf.msgspec import compiler as msgspec_compiler
+
+    def converter(accepts):
+        convert = mock.Mock()
+        convert.accepts = mock.Mock(return_value=accepts)
+        convert.column = mock.Mock(side_effect=list)
+        return convert
+
+    rows = [SimpleNamespace(a=index, b=index) for index in range(5)]
+    columns = [[row.a for row in rows], [row.b for row in rows]]
+    first, second = converter(True), converter(False)
+    converters = (("a", "a", first), ("b", "b", second))
+    assert not msgspec_compiler._complete_columns(rows, converters, columns)
+    first.column.assert_not_called()
+    second.column.assert_not_called()
+    second = converter(True)
+    converters = (("a", "a", first), ("b", "b", second))
+    assert msgspec_compiler._complete_columns(rows, converters, columns)
+    first.column.assert_called_once_with([0, 1, 2, 3, 4])

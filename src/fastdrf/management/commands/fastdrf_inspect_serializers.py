@@ -148,9 +148,15 @@ class Command(BaseCommand):
             "output": output if installed or not output.eligible else missing,
             "input": input_,
         }
+        return self._on_drf_bases(serializer, directions)
+
+    def _on_drf_bases(self, serializer, directions):
+        """
+        ``directions`` for ``serializer``: the backend never runs for one
+        built on DRF's classes, so say what fastdrf's bases would do.
+        """
         if isinstance(serializer, BackendMixin):
             return directions
-        # The backend never runs for it: say what fastdrf's bases would do.
         name = type(serializer).__name__
         prefix = (
             f"{name} is built on DRF's serializer classes, not fastdrf.serializers; "
@@ -197,34 +203,21 @@ class Command(BaseCommand):
             # DRF routers put @action(serializer_class=...) in initkwargs.
             # Inspect declarations only; never call get_serializer_class().
             initkwargs = getattr(callback, "initkwargs", {})
-            # GenericAPIView's get_serializer_class() returns serializer_class.
-            dynamic = view_class is not None and definer(
-                view_class, "get_serializer_class"
-            ) not in (None, GenericAPIView)
-            if isinstance(view_class, type) and issubclass(view_class, SchemaViewMixin):
-                # Its schemas, or its adapted schema class, are declarations too.
-                try:
-                    serializer_class = static_serializer(view_class, initkwargs)
-                except ImproperlyConfigured as exc:
-                    not_inspected.append((usage, str(exc)))
-                    continue
-                dynamic = definer(view_class, "get_serializer_class") is not (
-                    SchemaViewMixin
-                )
-            else:
-                serializer_class = initkwargs.get(
-                    "serializer_class", getattr(view_class, "serializer_class", None)
-                )
+            try:
+                serializer_class = self._declared_serializer(view_class, initkwargs)
+            except ImproperlyConfigured as exc:
+                not_inspected.append((usage, str(exc)))
+                continue
+            dynamic = view_class is not None and self._chooser(view_class)
             if serializer_class is not None:
                 if dynamic:
                     usage["note"] = (
-                        "get_serializer_class() may choose another serializer at "
-                        "request time"
+                        f"{dynamic}() may choose another serializer at request time"
                     )
                 found.setdefault(serializer_class, []).append(usage)
             elif dynamic:
                 not_inspected.append(
-                    (usage, "the view chooses its serializer in get_serializer_class()")
+                    (usage, f"the view chooses its serializer in {dynamic}()")
                 )
             elif hasattr(view_class, "get_serializer_class"):
                 not_inspected.append((usage, "the view declares no serializer_class"))
@@ -236,6 +229,31 @@ class Command(BaseCommand):
                     )
                 )
         return found, not_inspected
+
+    def _declared_serializer(self, view_class, initkwargs):
+        """
+        The serializer class ``view_class`` declares, with its ``as_view()``
+        arguments ``initkwargs``, or None. Raises ``ImproperlyConfigured`` for
+        one the view may not use.
+        """
+        if isinstance(view_class, type) and issubclass(view_class, SchemaViewMixin):
+            # Its schemas, or its adapted schema class, are declarations too.
+            return static_serializer(view_class, initkwargs)
+        return initkwargs.get(
+            "serializer_class", getattr(view_class, "serializer_class", None)
+        )
+
+    def _chooser(self, view_class):
+        """
+        The name of the method that may choose ``view_class``'s serializer per
+        request (one of the project's), or None.
+        """
+        owner = definer(view_class, "get_serializer_class")
+        # GenericAPIView's returns serializer_class, SchemaViewMixin's its
+        # declaration.
+        if owner in (None, GenericAPIView, SchemaViewMixin):
+            return None
+        return "get_serializer_class"
 
     def _not_inspected(self, name, usages, reason, exc, output_format):
         if output_format == "text":

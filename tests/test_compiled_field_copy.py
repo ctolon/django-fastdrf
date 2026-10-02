@@ -8,7 +8,7 @@ import pytest
 from django.test import override_settings
 from rest_framework import serializers as drf
 
-from fastdrf import serializers
+from fastdrf import _field_cache, serializers
 from fastdrf._field_copy import compile_fields
 from tests.models import Author
 from tests.threading import race
@@ -127,8 +127,8 @@ def test_view_and_serializer_selection_never_mutates_shared_settings():
     with override_settings(FASTDRF={}):
         chosen = Input(context={"view": view})
         with patch(
-            "fastdrf.serializers._compiled_field_copy_plan",
-            wraps=serializers._compiled_field_copy_plan,
+            "fastdrf._field_cache._compiled_field_copy_plan",
+            wraps=_field_cache._compiled_field_copy_plan,
         ) as plan:
             assert list(chosen.fields) == ["name"]
             assert plan.call_count == 1
