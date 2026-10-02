@@ -18,16 +18,18 @@ change DRF's validation errors.
 pip install django-fastdrf
 ```
 
-The distribution is `django-fastdrf`; the import name is `fastdrf`. Two
-extras install the optional backends:
+The distribution is `django-fastdrf`; the import name is `fastdrf`. Extras
+install the optional parts:
 
 ```console
-pip install "django-fastdrf[msgspec]"    # msgspec backend, renderer, parser, codec
-pip install "django-fastdrf[pydantic]"   # pydantic backend, schema serializers, codec
+pip install "django-fastdrf[msgspec]"      # msgspec backend, renderer, parser, codec
+pip install "django-fastdrf[pydantic]"     # pydantic backend, schema serializers, codec
+pip install "django-fastdrf[spectacular]"  # OpenAPI for schema serializers
 ```
 
-Adding `"fastdrf"` to `INSTALLED_APPS` is optional. It registers system checks
-and two management commands; everything else works without it.
+Adding `"fastdrf"` to `INSTALLED_APPS` is optional. It registers system
+checks, two management commands and, with drf-spectacular, the OpenAPI
+extension for schema serializers; everything else works without it.
 
 ## Quick start
 

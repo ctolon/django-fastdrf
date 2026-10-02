@@ -1,8 +1,8 @@
 """Check an installed django-fastdrf wheel without its optional extras.
 
-Every module imports with Django and DRF alone, except the msgspec and
-pydantic integrations, which need their extras. The wheel carries the type
-marker and the management commands.
+Every module imports with Django and DRF alone, except the msgspec, pydantic
+and drf-spectacular integrations, which need their extras. The wheel carries
+the type marker and the management commands.
 """
 
 import importlib
@@ -20,7 +20,7 @@ django.setup()
 
 import fastdrf  # noqa: E402
 
-OPTIONAL = ("fastdrf.msgspec.", "fastdrf.pydantic.")
+OPTIONAL = ("fastdrf.msgspec.", "fastdrf.pydantic.", "fastdrf.spectacular")
 modules = sorted(
     info.name for info in pkgutil.walk_packages(fastdrf.__path__, "fastdrf.")
 )

@@ -4,6 +4,27 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.3.0] - 2026-10-02
+
+### Added
+
+- `fastdrf.spectacular`: a drf-spectacular extension that documents schema
+  serializers (`MsgspecSerializer`, `PydanticSerializer`, `SchemaViewMixin`
+  views) from their schema classes, installed by the application with
+  drf-spectacular (`django-fastdrf[spectacular]`). Without it,
+  drf-spectacular documented every field as a read-only string, lost
+  constraints, nested classes and enums, and gave a `SchemaViewMixin` view
+  the output schema as its request body.
+
+### Fixed
+
+- The view mixins (`DispatchOptimizationMixin`, `QueryOptimizationMixin`,
+  `DataResponseMixin`, `NegotiationCacheMixin`, `RequestPlanMixin`,
+  `SchemaViewMixin`) no longer have docstrings: drf-spectacular published
+  them as the description of every view without one of its own.
+
 ## [0.2.0] - 2026-10-02
 
 ### Added
