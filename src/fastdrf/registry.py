@@ -33,11 +33,15 @@ import dataclasses
 import types
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from django.core.exceptions import ImproperlyConfigured
 from django.db import models
-from rest_framework import fields, relations
+
+if TYPE_CHECKING:
+    # Imported when used: the msgspec types are read by modules that work
+    # without DRF (fastdrf.msgspec.http).
+    from rest_framework import fields, relations
 
 __all__ = [
     "own_representation",
@@ -86,7 +90,7 @@ def register_model_field(
 
 
 def register_field(
-    field_class: type[fields.Field],
+    field_class: "type[fields.Field]",
     *,
     options: Iterable[str] | Mapping[str, Callable[[Any], Any] | None] = (),
     representation: Representation | None = None,
@@ -107,6 +111,8 @@ def register_field(
     The output must be of JSON types (str, int, float, bool, None, lists and
     dicts of them), which the backends emit unchanged.
     """
+    from rest_framework import fields
+
     from fastdrf import compiler
 
     _check_field_class(field_class, fields.Field, "serializer field class")
@@ -118,7 +124,7 @@ def register_field(
 
 
 def register_key_field(
-    relation_class: type[relations.PrimaryKeyRelatedField],
+    relation_class: "type[relations.PrimaryKeyRelatedField]",
     *,
     representation: Representation,
     options: Iterable[str] | Mapping[str, Callable[[Any], Any] | None] = (),
@@ -131,6 +137,8 @@ def register_key_field(
     compiled class does not load) to the output, or None to leave the
     serializer to DRF. ``options`` is as for :func:`register_field`.
     """
+    from rest_framework import relations
+
     from fastdrf import compiler
 
     _check_field_class(
@@ -307,7 +315,7 @@ class Registration(NamedTuple):
 
 
 def registrations() -> tuple[Registration, ...]:
-    """What is registered, in registration order within each kind."""
+    """The registrations, in registration order within each kind."""
     from fastdrf import compiler
     from fastdrf.renderers import _DATA_RENDERERS
 
@@ -392,7 +400,7 @@ def _same(first: Any, second: Any) -> bool:
         return False
 
 
-def own_representation(field: fields.Field) -> Callable[[Any], Any]:
+def own_representation(field: "fields.Field") -> Callable[[Any], Any]:
     """
     The default representation of a registered field: ``to_representation``
     of a copy of ``field`` that belongs to no serializer, so the compiled

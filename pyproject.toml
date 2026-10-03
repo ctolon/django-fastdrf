@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "django-fastdrf"
-version = "0.4.0"
+version = "0.5.0"
 description = "Opt-in serializer and query optimizations for synchronous Django REST framework."
 readme = "README.md"
 license = "BSD-3-Clause"

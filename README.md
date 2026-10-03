@@ -139,6 +139,9 @@ Views and responses:
 - A `JSONRenderer` that keeps its encoder, msgspec, Pydantic and orjson JSON
   parsers/renderers, and msgspec and Pydantic codecs for Django's Redis cache
   ([rendering and codecs](https://github.com/ctolon/django-fastdrf/blob/main/docs/rendering.md)).
+- `JsonResponse` and `json_script` encoded by msgspec for Django views and
+  templates outside DRF, with the registered msgspec types
+  ([JSON in Django views and templates](https://github.com/ctolon/django-fastdrf/blob/main/docs/django-utilities.md)).
 
 Tooling:
 

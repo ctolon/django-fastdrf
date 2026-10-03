@@ -232,7 +232,7 @@ def _read_serializer(
 
 
 def _contract(schema: Schema) -> tuple[Any, ...]:
-    """What a written class says: its fields as written, and its notes."""
+    """A written class's fields as written, and its notes."""
     return (
         [
             (
@@ -861,7 +861,7 @@ _CONSTRAINT_NAMES = (
 )
 
 
-# What metadata may carry besides constraints without changing validation.
+# Metadata keys allowed besides constraints; they do not change validation.
 _DOCUMENTATION = ("title", "description", "examples", "extra_json_schema", "extra")
 
 

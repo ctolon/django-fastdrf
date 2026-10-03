@@ -82,7 +82,7 @@ A to-many read with datetimes and decimals at the second level.
 `Meta.prefetch` adds a `Prefetch` that defers the article body, which the
 summaries do not include.
 
-## What the fastdrf side enables
+## fastdrf options in this example
 
 See `config/settings.py` and `blog/fast/`.
 

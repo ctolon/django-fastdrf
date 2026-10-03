@@ -120,9 +120,10 @@ INSTALLED_APPS = [
 
 The app (`fastdrf.apps.FastDRFConfig`) defines no models. It registers the
 [system checks](#system-checks), makes the
-[management commands](commands.md) available and, with drf-spectacular,
-loads the OpenAPI extension for schema serializers. Every other feature works
-without it.
+[management commands](commands.md) and the `fastdrf_msgspec` template
+library ([JSON in Django templates](django-utilities.md#json_script-and-the-template-filter))
+available and, with drf-spectacular, loads the OpenAPI extension for schema
+serializers. Every other feature works without it.
 
 The applications of `fastdrf.contrib` (`fastdrf.contrib.phonenumber`,
 `fastdrf.contrib.countries`, `fastdrf.contrib.money`) register the fields of

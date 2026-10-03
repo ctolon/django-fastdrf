@@ -1089,7 +1089,7 @@ def _check_framework_read(model: Any, attribute: str) -> None:
     ):
         raise NotCompilable(f"{where} is a {type(field).__name__}", code="custom_hook")
     if isinstance(descriptor, ForwardManyToOneDescriptor):
-        # What ``get_queryset()`` of the descriptor reads a missing object with.
+        # The manager the descriptor's ``get_queryset()`` reads a missing object with.
         manager = field.remote_field.model._base_manager
     elif isinstance(descriptor, ReverseManyToOneDescriptor):
         # The related manager is a subclass of the default manager's class.
@@ -1166,7 +1166,7 @@ def _check_related_model(name: str, serializer: Any, related_model: Any) -> None
 
 
 def related_items(value: Any) -> Any:
-    """What DRF's ``ListSerializer.to_representation`` iterates for ``value``."""
+    """The iterable DRF's ``ListSerializer.to_representation`` uses for ``value``."""
     return value.all() if isinstance(value, models.manager.BaseManager) else value
 
 
@@ -1244,7 +1244,7 @@ def _scalar_type(field: Any, name: str, model_field: Any, parity: str) -> Any:
             )
         return python_type
     if _BIG_INTEGER is not None and field_class is _BIG_INTEGER:
-        # What ModelSerializer builds for BigAutoField and BigIntegerField:
+        # ModelSerializer's field for BigAutoField and BigIntegerField:
         # IntegerField's output unless it is coerced to a string.
         if _option(field, "coerce_to_string") in (_ABSENT, None):
             coerced = api_settings.COERCE_BIGINT_TO_STRING
@@ -1423,7 +1423,7 @@ class _Call:
         return self._zone
 
     def context(self, digits: Any, rounding: Any) -> decimal.Context:
-        # What DRF's ``DecimalField.quantize`` builds for each value.
+        # The context DRF's ``DecimalField.quantize`` builds for each value.
         try:
             return self._contexts[digits, rounding]
         except KeyError:
@@ -2042,7 +2042,7 @@ def loaded_encoder(serializer: serializers.BaseSerializer) -> "Encoder | None":
 
 _TOO_MANY_VARIANTS = f"its instances have more than {MAX_VARIANTS} field sets"
 
-# What DRF's representation calls on a serializer and on its fields.
+# Methods DRF's representation calls on a serializer and on its fields.
 _INSTANCE_HOOKS = ("to_representation", "get_attribute")
 
 

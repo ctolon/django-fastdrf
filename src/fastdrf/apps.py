@@ -3,10 +3,10 @@ Django application of django-fastdrf.
 
 Installing it (``"fastdrf"`` in ``INSTALLED_APPS``) is optional. It defines
 no models; it makes the ``fastdrf_inspect_serializers`` and
-``fastdrf_convert`` management commands available, registers the system
-checks of :mod:`fastdrf.checks` and, when drf-spectacular is installed, the
-OpenAPI extension of :mod:`fastdrf.spectacular`. Everything else works
-without it.
+``fastdrf_convert`` management commands and the ``fastdrf_msgspec`` template
+library available, registers the system checks of :mod:`fastdrf.checks` and,
+when drf-spectacular is installed, the OpenAPI extension of
+:mod:`fastdrf.spectacular`. Everything else works without it.
 """
 
 from importlib.util import find_spec

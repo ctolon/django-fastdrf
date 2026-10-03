@@ -116,7 +116,7 @@ def _iso(value: datetime.datetime) -> str:
     return text[:-6] + "Z" if text.endswith("+00:00") else text
 
 
-# What the msgspec backend accepts for a typed field (``strict`` conversion)
+# Values the msgspec backend accepts for a typed field (``strict`` conversion)
 # and outputs for it; anything else is the source's to DRF.
 def _string(value: Any) -> str:
     # A ``CharField`` converts with ``str()`` (``compiler._exact_string``);
