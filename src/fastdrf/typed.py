@@ -123,7 +123,7 @@ class SchemaListSerializer(drf.ListSerializer):
         return super().to_internal_value(data)
 
     def run_validation(self, data: Any = empty) -> Any:
-        # What validation returned, by identity: ``validated_data`` at the
+        # The validation result, by identity: ``validated_data`` at the
         # top, or the value a parent serializer holds for this field, which
         # DRF gives to_representation() when it represents its own.
         value = super().run_validation(data)
@@ -231,7 +231,7 @@ def _read_relations(
     }
     field_schemas = getattr(backend, "field_schemas", None)
     if field_schemas is not None:
-        # What validation reads (an excluded field too), and what it holds.
+        # The fields validation reads (an excluded one too), and what each holds.
         read = field_schemas(schema)
     else:
         # A backend of another package: the output's fields, holding no schema.
@@ -278,7 +278,7 @@ def _represent_validated(
 
 
 class SchemaBackend(Protocol):
-    """What a schema library provides to :class:`SchemaSerializer`."""
+    """The interface a schema library provides to :class:`SchemaSerializer`."""
 
     def load(self, schema: type, data: Any, *, strict: bool | None) -> Any: ...
 
@@ -450,7 +450,7 @@ class SchemaSerializer(drf.Serializer):
         obj = self.backend.load(schema, data, strict=strict)
         values = self.backend.values(obj, partial=partial)
         self._validated_object = obj
-        # What validate() may change in place: compared in to_representation().
+        # validate() may change these in place; to_representation() compares them.
         self._read_values = None if partial else dict(values)
         return values
 

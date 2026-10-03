@@ -543,3 +543,64 @@ def test_conversion_buffers_release_objects_after_success_and_failure():
         del value
     gc.collect()
     assert all(ref() is None for ref in references)
+
+
+def test_the_public_encoding_hook_converts_in_drfs_order():
+    from django.utils.functional import lazy
+    from django.utils.safestring import mark_safe
+
+    from fastdrf.registry import register_msgspec_type
+    from fastdrf.testing import isolated_registry
+
+    class Label(str):
+        pass
+
+    class Pair(tuple):
+        pass
+
+    class Array:
+        def tolist(self):
+            return [1, 2]
+
+        def __iter__(self):
+            return iter([3])
+
+    lazy_text = lazy(lambda: "lazy", str)()
+    for value, expected in [
+        (ErrorDetail("Nope", code="x"), "Nope"),
+        (mark_safe("<b>"), "<b>"),
+        (Label("label"), "label"),
+        (lazy_text, "lazy"),
+        (Array(), [1, 2]),
+        (types.MappingProxyType({"a": 1}), {"a": 1}),
+        (collections.ChainMap({"a": 1}), {"a": 1}),
+        (Pair((1, 2)), [1, 2]),
+        ({1, 2}, [1, 2]),
+        ((n for n in (1, 2)), [1, 2]),
+    ]:
+        converted = enc_hook(value)
+        assert converted == expected
+        assert type(converted) is type(expected)
+    with pytest.raises(TypeError, match="Object of type bytearray"):
+        enc_hook(bytearray(b"x"))
+
+    with isolated_registry():
+        # A registered type comes first, also when it is a string, a lazy
+        # object or an iterable.
+        register_msgspec_type(
+            Label,
+            encode=lambda value: {"label": str(value)},
+            decode=lambda type_, value: type_(),
+        )
+        register_msgspec_type(
+            Pair, encode=lambda value: "pair", decode=lambda type_, value: type_()
+        )
+        register_msgspec_type(
+            Array, encode=lambda value: "array", decode=lambda type_, value: type_()
+        )
+        assert enc_hook(Label("x")) == {"label": "x"}
+        assert enc_hook(Pair((1,))) == "pair"
+        assert enc_hook(Array()) == "array"
+        assert MsgspecJSONRenderer().render([Label("x"), Array()]) == (
+            b'[{"label":"x"},"array"]'
+        )

@@ -30,7 +30,7 @@ DRF 3.16.0) on the same machine.
 - Before and after timings of one change are taken in alternating runs of
   the two versions, on the same core.
 
-## What changes the results
+## Factors that change the results
 
 - The processor: its microarchitecture, clock speed and turbo behaviour,
   cache sizes, and whether the process runs on a performance or an

@@ -121,6 +121,7 @@ def tests_without_extras(session):
         "tests/test_python_backend.py",
         "tests/test_settings.py",
         "tests/test_list_serializer_hook.py",
+        "tests/test_django_templatetags.py",
         *session.posargs,
     )
 

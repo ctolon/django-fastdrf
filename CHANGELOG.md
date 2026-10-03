@@ -6,6 +6,40 @@ project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-03
+
+### Added
+
+- `fastdrf.msgspec.http.JsonResponse`: Django's `JsonResponse` for views
+  outside DRF, with its `safe` argument and message, `content_type`,
+  status, headers and cookies, and a body encoded by msgspec with the types
+  registered with `register_msgspec_type()` and an optional `enc_hook`. It
+  does not import DRF. `encoder=` and `json_dumps_params=` are not
+  accepted. The output differs from `DjangoJSONEncoder`'s for datetimes and
+  times with microseconds, aware times, durations, NaN and bytes, and the
+  body is UTF-8; each difference is documented and tested.
+- `fastdrf.msgspec.html.json_script()` and the `fastdrf_msgspec` template
+  library: Django's `json_script` encoded by msgspec, which escapes U+2028
+  and U+2029 as well as `<`, `>` and `&`. Templates opt in with
+  `{% load fastdrf_msgspec %}`, with `"fastdrf"` in `INSTALLED_APPS`; the
+  library imports msgspec only when the filter runs.
+- `fastdrf.codecs.MsgspecCodec.supports_integer_operations`: the
+  asynchronous backend of aiodrf-async-cache counts with `aincr()` and
+  `adecr()` on values the codec stores.
+- [JSON in Django views and templates](https://github.com/ctolon/django-fastdrf/blob/main/docs/django-utilities.md),
+  with the order in which `enc_hook`, the registry and the Django
+  conversions run, and why fastdrf has no signing or session serializer.
+- `tools/benchmark_json_transport.py` compares Django's `JsonResponse` and
+  `json_script` with these.
+
+### Changed
+
+- `MsgspecJSONRenderer` converts registered types, `str` subclasses and
+  lazy strings with the code `JsonResponse` and `json_script` use. Its output
+  is unchanged.
+- `fastdrf.registry` imports DRF when a registration needs it, not when the
+  module is imported.
+
 ## [0.4.0] - 2026-10-03
 
 Timings below were measured on the reference machine described in

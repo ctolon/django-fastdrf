@@ -16,6 +16,7 @@ from django.dispatch import receiver
 from django.utils.functional import Promise
 from rest_framework.renderers import JSONRenderer
 
+from fastdrf.msgspec._convert import convert
 from fastdrf.registry import _MSGSPEC_TYPES, msgspec_hooks
 from fastdrf.renderers import _DATA_RENDERERS, _without_indent
 
@@ -49,18 +50,13 @@ def _debugging() -> bool:
 
 
 def enc_hook(obj):
-    hooks = msgspec_hooks(type(obj))
-    if hooks is not None and hooks.encode is not None:
-        # A type of the project's (fastdrf.registry.register_msgspec_type),
-        # first: it may be iterable or a str subclass too.
-        return hooks.encode(obj)
-    # msgspec only encodes exact ``str``. ``ErrorDetail`` is a subclass and
-    # ``str.__str__`` copies it into a plain string; lazy translations are
-    # proxies that ``str()`` evaluates.
-    if isinstance(obj, str):
-        return str.__str__(obj)
-    if isinstance(obj, Promise):
-        return str(obj)
+    # A registered type, a str subclass (``ErrorDetail``) or a lazy string,
+    # as JsonResponse and json_script convert them; then DRF's conversions.
+    value = convert(obj)
+    return _drf_conversion(obj) if value is NotImplemented else value
+
+
+def _drf_conversion(obj):
     if hasattr(obj, "tolist"):
         # numpy arrays and scalars, like DRF's encoder.
         return obj.tolist()
@@ -89,7 +85,12 @@ def _render_hook(obj):
     # Replay state belongs to the renderer, not to callers using the public
     # encoding hook on its own.
     try:
-        value = enc_hook(obj)
+        # ``enc_hook``'s steps, called here: one call less per value. Without
+        # a registered type, ``convert`` has nothing left to convert: the
+        # strings were converted above.
+        value = convert(obj) if _MSGSPEC_TYPES else NotImplemented
+        if value is NotImplemented:
+            value = _drf_conversion(obj)
     except Exception as error:
         _remember_conversion(obj, error, failed=True)
         raise

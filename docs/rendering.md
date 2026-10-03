@@ -45,7 +45,9 @@ REST_FRAMEWORK = {
 ```
 
 They are independent of the serializer backend: compiled serializers work
-with any renderer, and these classes work with any serializer.
+with any renderer, and these classes work with any serializer. For JSON
+outside DRF, in Django views and templates, see
+[JSON in Django views and templates](django-utilities.md).
 
 ### Differences from DRF's renderer
 
@@ -105,6 +107,29 @@ msgspec's. It also refuses two inputs DRF's parser accepts:
 | --- | --- | --- |
 | a number out of the float range (`1e400`) | `inf` | `ParseError` |
 | an unpaired surrogate escape (`"\ud800"`) | a string holding it | `ParseError` |
+
+### Registered types and hook order
+
+The renderer, `fastdrf.msgspec.http.JsonResponse`,
+`fastdrf.msgspec.html.json_script` and a typed `MsgspecCodec` encode a type
+registered with [`register_msgspec_type()`](extending.md#msgspec-types)
+with its `encode` hook, and give the same JSON value for it. msgspec asks a
+hook only for a type it does not encode itself; for such an object the
+conversions run in this order:
+
+1. an `enc_hook` passed by the caller (`JsonResponse(..., enc_hook=...)`,
+   `json_script(..., enc_hook=...)`, `MsgspecCodec(type, enc_hook=...)`, a
+   schema serializer's `Meta.enc_hook`); one that raises
+   `NotImplementedError` leaves the object to the next steps;
+2. the registered type's `encode`, for its class or nearest registered base;
+3. a `str` subclass (`ErrorDetail`, `SafeString`) or a lazy translation
+   string as its text;
+4. for the renderer only, DRF's conversions: `tolist()`, a QuerySet, a
+   mapping and other iterables. `JsonResponse` and `json_script` raise
+   `TypeError` instead, as `DjangoJSONEncoder` does.
+
+`MsgspecCodec` and schema serializers stop after step 2. An untyped `MsgspecCodec()` does not use the registry, and the
+Pydantic and orjson renderers do not either.
 
 ## Pydantic JSON renderer and parser
 
@@ -323,6 +348,9 @@ typed one uses the types registered with `register_msgspec_type()`
 
 - Integers are stored as Redis integers, as Django's own serializer stores
   them, so `incr()` and `decr()` use Redis's atomic `INCR`.
+  `MsgspecCodec.supports_integer_operations` is `True`: the asynchronous
+  backend of aiodrf-async-cache reads it before `aincr()` and `adecr()`
+  count with such a codec.
 - `PydanticCodec` validates each value before storing it. For a type
   expression it enables the pydantic options under which every accepted value
   round-trips (non-finite floats, bytes as base64); a model, dataclass,

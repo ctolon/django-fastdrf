@@ -207,6 +207,52 @@ def test_an_untyped_cache_codec_refuses_a_registered_type():
         MsgspecCodec().dumps(Money("5.10", "EUR"))
 
 
+def _through_renderer(data):
+    from fastdrf.msgspec.renderers import MsgspecJSONRenderer
+
+    return msgspec.json.decode(MsgspecJSONRenderer().render(data))
+
+
+def _through_json_response(data):
+    from fastdrf.msgspec.http import JsonResponse
+
+    return msgspec.json.decode(JsonResponse(data).content)
+
+
+def _through_json_script(data):
+    from fastdrf.msgspec.html import json_script
+
+    body = json_script(data).removeprefix('<script type="application/json">')
+    return msgspec.json.decode(body.removesuffix("</script>"))
+
+
+def _through_typed_codec(data):
+    from fastdrf.codecs import MsgspecCodec
+
+    codec = MsgspecCodec(dict[str, list[Money]])
+    stored = codec.dumps(data)
+    assert codec.loads(stored) == data
+    return msgspec.msgpack.decode(stored)
+
+
+@pytest.mark.parametrize(
+    "through",
+    [
+        _through_renderer,
+        _through_json_response,
+        _through_json_script,
+        _through_typed_codec,
+    ],
+    ids=lambda through: through.__name__.removeprefix("_through_"),
+)
+def test_one_registration_gives_the_same_value_everywhere(through):
+    # The deliberate exceptions, in docs/django-utilities.md: an untyped
+    # MsgspecCodec (above), and the Pydantic and orjson renderers.
+    register()
+    data = {"prices": [Money("5.10", "EUR"), Money("-1", "TRY")]}
+    assert through(data) == {"prices": ["5.10 EUR", "-1 TRY"]}
+
+
 class Span:
     """Iterable: the renderer's own handling of iterables must not win."""
 

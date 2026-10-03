@@ -31,6 +31,10 @@ class MsgspecCodec:
     ``INCR``; they are decoded into ``type`` like any other value.
     """
 
+    #: Integers are Redis integers: a cache backend that asks (the native
+    #: asynchronous backend of aiodrf-async-cache) may count with ``INCRBY``.
+    supports_integer_operations = True
+
     def __init__(self, type=Any, *, enc_hook=None, dec_hook=None):
         import msgspec
 
@@ -66,7 +70,7 @@ class MsgspecCodec:
         return self.decoder.decode(value)
 
 
-# What a cached value needs of Pydantic's JSON: non-finite floats written as
+# Pydantic JSON settings a cached value needs: non-finite floats written as
 # JSON's usual extension (by default they become ``null``) and bytes as base64
 # (by default they must be UTF-8), so that what the type accepts comes back.
 _ROUND_TRIP = {

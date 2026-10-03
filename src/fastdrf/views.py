@@ -156,7 +156,7 @@ _NEGOTIATION_HOOKS = (
     "get_renderers",
     "get_content_negotiator",
 )
-# Where a project's code runs between building DRF's request and negotiating.
+# Hooks that run project code between building DRF's request and negotiating.
 _BEFORE_NEGOTIATION_HOOKS = (
     "dispatch",
     "initialize_request",

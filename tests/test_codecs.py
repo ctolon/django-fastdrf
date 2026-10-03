@@ -193,6 +193,12 @@ def test_integers_are_redis_integers(codec_class):
     assert codec.loads(b"50") == 50
 
 
+def test_the_msgspec_codec_says_that_it_stores_integers_as_redis_integers():
+    # Read by aiodrf-async-cache before it lets aincr() and adecr() count.
+    assert MsgspecCodec.supports_integer_operations is True
+    assert MsgspecCodec(int).supports_integer_operations is True
+
+
 def test_msgspec_integers_are_decoded_into_the_codecs_type():
     assert MsgspecCodec(float).loads(MsgspecCodec(float).dumps(3)) == 3.0
     assert type(MsgspecCodec(float).loads(b"3")) is float

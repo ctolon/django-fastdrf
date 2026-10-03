@@ -72,7 +72,7 @@ class JSONRenderer(renderers.JSONRenderer):
         encoder = self._encoders.get(key)
         if encoder is None:
             encoder = self._encoders.setdefault(key, _dumps_encoder(self))
-        # What DRF's ``render`` returns after ``json.dumps``.
+        # DRF's ``render`` output after ``json.dumps``.
         ret = encoder.encode(data)
         return ret.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029").encode()
 

@@ -73,7 +73,7 @@ def _release(response):
     _release_data(response.data)
 
 
-# What DRF's ``serializer.data`` returns, referring to its serializer.
+# The types DRF's ``serializer.data`` returns, referring to its serializer.
 _RETURNED = (ReturnList, ReturnDict)
 
 

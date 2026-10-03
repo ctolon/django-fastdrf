@@ -794,7 +794,7 @@ def _publish(
         return variants.setdefault(key, recognizer)
 
 
-# What DRF's validation calls on a serializer, a list serializer and their
+# Methods DRF's validation calls on a serializer, a list serializer and their
 # fields: the hooks refused on their classes, assigned to an instance.
 _INSTANCE_HOOKS = (
     *_LIST_HOOKS,
@@ -850,7 +850,7 @@ def _signature(serializer: Any) -> tuple[Any, ...]:
 
 
 def _instance_signature(serializer: Any) -> tuple[bool, bool, bool]:
-    """What :func:`analyze_input` reads from an instance besides its fields."""
+    """The instance state :func:`analyze_input` reads besides the fields."""
     return (
         bool(serializer.root.partial),
         bool(serializer.validators),

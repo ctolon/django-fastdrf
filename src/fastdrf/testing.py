@@ -123,7 +123,7 @@ def _fresh(instances: Any) -> Callable[[], Any]:
 
 @contextmanager
 def _produced_by(serializer_class: type) -> Iterator[list[Any]]:
-    """What produced each output of ``serializer_class`` (``fastdrf.signals``)."""
+    """The producer of each output of ``serializer_class`` (``fastdrf.signals``)."""
     produced: list[Any] = []
 
     def compiled(sender: type, backend: str, **kwargs: Any) -> None:

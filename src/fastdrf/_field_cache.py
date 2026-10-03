@@ -194,7 +194,7 @@ def _model_serializer_fields(serializer, build):
     if not (enabled and _static_fields(serializer)):
         return build()
     if serializer.url_field_name is None:
-        # What DRF's ``get_fields`` sets.
+        # As DRF's ``get_fields`` sets it.
         serializer.url_field_name = api_settings.URL_FIELD_NAME
     cls = type(serializer)
     if mode == "compiled":

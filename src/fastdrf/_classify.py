@@ -1,4 +1,4 @@
-"""Which serializers are a function of their class; coroutine hooks refused."""
+"""Serializers that are a function of their class; coroutine hooks refused."""
 
 import inspect
 import weakref
@@ -53,7 +53,7 @@ def _model_fields_call_code(model):
     return False
 
 
-# What DRF sets on a serializer instance over a class attribute of the same
+# Attributes DRF sets on a serializer instance over a class attribute of the same
 # name. Any other instance attribute that shadows one of the class may change
 # what DRF does: a method assigned to the instance, fields materialized (and
 # perhaps edited), a ``Meta`` or ``url_field_name`` of its own.
@@ -161,7 +161,7 @@ _instance_shadow_names = _statics.shadow_names
 _static_declaration = _statics.static_declaration
 
 
-# What DRF materializes on an instance the first time it is read. Once any of
+# Attributes DRF materializes on an instance when first read. Once any of
 # these exists, the instance's fields may have been changed; the class says
 # nothing about such an instance.
 _MATERIALIZED = frozenset(

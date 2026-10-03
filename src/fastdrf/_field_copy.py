@@ -214,7 +214,7 @@ def _eligible(field: fields.Field, *, allow_bound: bool = False) -> bool:
     )
 
 
-# What DRF's constructors of the ``_SCALARS`` set from an argument of the same
+# Attributes DRF's constructors of the ``_SCALARS`` set from an argument of the same
 # name, and the value they set without it (``rest_framework.fields``).
 _FROM_ARGUMENTS = {
     "write_only": False,
