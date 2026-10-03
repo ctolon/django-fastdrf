@@ -106,7 +106,7 @@ class BackendMixin:
             and not getattr(self, "_errors", None)
             and (not hasattr(self, "initial_data") or hasattr(self, "_validated_data"))
         ):
-            from fastdrf._compiled import compiled_data
+            from fastdrf._compiled import _compiled, compiled_data
             from fastdrf.compiler import loaded_encoder
 
             encoder = loaded_encoder(self)
@@ -117,6 +117,7 @@ class BackendMixin:
                     # Let the ordinary compiler path decide DRF fallback/error.
                     pass
                 else:
+                    _compiled(self, encoder, many=False)
                     return super().data
             produce = compiled_data(self)
             if produce is not None:

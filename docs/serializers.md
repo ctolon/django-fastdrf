@@ -1,5 +1,11 @@
 # Serializers
 
+For complete examples of nested reads, relation writes, partial updates, and
+collections, see [serializer usage examples](serializer-examples.md).
+For DRF-style versus native Pydantic/msgspec declarations, see
+[serializer styles](serializer-styles.md). Existing projects can follow the
+[DRF migration guide](migrating-from-drf.md).
+
 ## Serializer bases
 
 `fastdrf.serializers` provides `BaseSerializer`, `Serializer`,
@@ -26,7 +32,11 @@ public interface (`.data`, `.is_valid()`, `.errors`, `.validated_data`,
 
 Custom `to_representation`, `validate()`, field hooks and custom field classes
 are respected. They make a serializer ineligible for the optimization that
-would skip them, and DRF's code runs instead.
+would skip them, and DRF's code runs instead. Fields of other packages and of
+the project can be registered with the compiler
+([fields of other packages](extending.md)), and the fields the compiler
+cannot express can be represented by their own code inside the compiled
+output ([delegated fields](#delegated-fields)).
 
 ## Output backends
 
@@ -66,7 +76,9 @@ fields compile:
   queryset annotation;
 - nested serializers on forward foreign keys, and nested `many=True`
   serializers on many-to-many fields and reverse foreign keys, compiled
-  recursively.
+  recursively;
+- fields and model fields registered with `fastdrf.registry` or by a
+  `fastdrf.contrib` application ([fields of other packages](extending.md)).
 
 Anything else keeps the serializer on DRF: `SerializerMethodField`, custom
 field classes, `to_representation` or `get_attribute` overrides, methods
@@ -94,12 +106,66 @@ that equals DRF's. `"fast"` additionally accepts:
   `ReadOnlyField` or `ModelField`), output as the backend formats them;
 - fields of a plain `Serializer` without a model field behind them, and
   `JSONField` values;
-- attributes read through properties or managers of the project's.
+- attributes read through properties or managers of the project's, and
+  columns of model fields of other packages that are not registered; their
+  values are output by DRF's field, as in strict parity.
+
+Strict parity reads the values Django loads: an `IntegerField` or
+`FloatField` column holds an `int` or a `float`. A value of a subclass that
+the project assigns to an instance is output as its number (an
+`IntegerChoices` member as its value, which is DRF's `int(value)` too); a
+subclass that overrides `__int__` or `__float__` to give another number is
+not read through that method. Checking every value's type would cost a pass
+over each numeric column of every list. A `ReadOnlyField`, which DRF leaves
+as it is, keeps such a value: a subclass leaves the instance to DRF.
 
 In fast parity a source the compiled class cannot read raises the backend's
 error instead of being represented by DRF. `fast` is an explicit relaxation
 for endpoints whose clients accept these differences, not a faster form of
 `strict`.
+
+### Delegated fields
+
+With `DELEGATE_FIELDS = True` (or `Meta.delegate_fields = True`) a field the
+backend cannot compile no longer leaves its serializer to DRF: the backend
+compiles the other fields, and the field's own code represents it in the
+compiled output. Each such field runs as in DRF's
+`Serializer.to_representation`: its `get_attribute()` (a `SkipField` leaves
+the key out), `None` output as `None`, else its `to_representation()`, once
+per item, with the serializer's context, and its key keeps its place. That
+covers `SerializerMethodField`, hyperlinked fields (`url` of a
+`HyperlinkedModelSerializer`), properties and methods as sources, dotted
+sources, and fields of other packages that are not registered. The value is
+what the field returns, as DRF leaves it in `.data`.
+
+A serializer nested on a foreign key delegates its own fields the same way
+(reported as `author.label`), at their place among the parent's: the related
+object Django keeps after the compiled read is read again, without a query.
+Its own `Meta.delegate_fields` decides for its fields; without one, its
+parent's choice does. A nested `many=True`
+serializer with such a field is delegated as a whole, since reading a
+related manager again would query again without a prefetch.
+
+A serializer whose fields are all delegated, a plain `Serializer` without
+`Meta.model` (delegation needs model instances), and a field whose code is a
+coroutine stay on DRF; so does everything that is not about one field (an
+overridden `to_representation`, a custom list serializer).
+
+The delegated fields run after the compiled fields have read the instance,
+where DRF reads each field after the ones before it. A method that changes
+the instance for another field (`obj.total = ...`, read by a later field)
+gives that field the value from before the change, and when two items fail
+in different fields, the error raised may be another item's than DRF's
+first; that is why delegation is not the default. A list of 1,000 rows with five compiled fields and one
+`SerializerMethodField` takes 0.87 ms with the msgspec backend instead of
+DRF's 3.05 ms; with five method fields 3.02 ms instead of 5.47 ms. With one
+compiled field and ten delegated ones the difference is within 5% either
+way: what remains is the fields' own code (measured on the
+[reference machine](benchmarks.md), as described in
+[fields of other packages](extending.md#integrations)).
+
+`report_details()` and `fastdrf_inspect_serializers` name the delegated
+fields (`output compiled; delegated: label`).
 
 ### Fallback
 
@@ -248,4 +314,8 @@ output = report_details(ArticleSerializer(), backend="msgspec")
 input_ = report_input_details(ArticleSerializer(data={}), backend="msgspec")
 ```
 
-Both return an `Eligibility` with a stable `code` and a readable `reason`.
+Both return an `Eligibility` with a stable `code`, a readable `reason`, and
+`delegated`, the [delegated fields](#delegated-fields) of a compiled output.
+`fastdrf.testing.assert_compiled_as_drf()` compares a serializer's compiled
+output with DRF's for given instances, in tests
+([testing a registration](extending.md#testing)).

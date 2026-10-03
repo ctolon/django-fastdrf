@@ -20,7 +20,7 @@ from django.test.utils import isolate_apps
 
 from fastdrf import compiler
 from fastdrf import serializers as drf_serializers
-from tests.models import Author, Book, Edition
+from tests.models import Author, Book, Edition, Tag
 
 
 def _data(serializer):
@@ -354,6 +354,70 @@ def test_a_method_assigned_to_a_list_or_its_items_keeps_drfs_output(
         serializer.to_representation.assert_called_once_with(authors)
     # The inspector says what the runtime does.
     assert "assigned to the instance" in compiler.report(hooked(authors))
+
+
+class BookRelations(drf_serializers.ModelSerializer):
+    tag_names = drf_serializers.SlugRelatedField(
+        source="tags", many=True, slug_field="name", read_only=True
+    )
+    tag_ids = drf_serializers.PrimaryKeyRelatedField(
+        source="tags", many=True, read_only=True
+    )
+
+    class Meta:
+        model = Book
+        fields = ["title", "tag_names", "tag_ids"]
+
+
+def _slug_child_hook(serializer):
+    serializer.fields["tag_names"].child_relation.to_representation = lambda value: (
+        "[redacted]"
+    )
+
+
+def _pk_child_hook(serializer):
+    serializer.fields["tag_ids"].child_relation.to_representation = lambda value: (
+        "[redacted]"
+    )
+
+
+def _many_pk_field_hook(serializer):
+    child = serializer.fields["tag_ids"].child_relation
+    child.pk_field = drf_serializers.IntegerField()
+    child.pk_field.to_representation = lambda value: "[redacted]"
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize(
+    "hook", [_slug_child_hook, _pk_child_hook, _many_pk_field_hook]
+)
+@pytest.mark.parametrize("many", [False, True])
+def test_a_method_assigned_to_a_relations_child_keeps_drfs_output(backend, hook, many):
+    book = Book.objects.create(
+        title="b", isbn="1", author=Author.objects.create(name="a")
+    )
+    book.tags.add(Tag.objects.create(name="private-label"))
+    source = [book] if many else book
+
+    def hooked():
+        serializer = BookRelations(source, many=many)
+        hook(serializer.child if many else serializer)
+        return serializer
+
+    expected = hooked().data
+    assert "[redacted]" in str(expected)
+    with override_settings(FASTDRF={"SERIALIZER_BACKEND": backend}):
+        # The class entry is warm: the plain serializer compiles.
+        assert (
+            _data(BookRelations(source, many=many))
+            == BookRelations(source, many=many).data
+        )
+        assert _data(hooked()) == expected
+        assert (
+            _data(BookRelations(source, many=many))
+            == BookRelations(source, many=many).data
+        )
 
 
 # -- What DRF represents, the compiled path represents the same or declines --------
@@ -830,3 +894,59 @@ def test_a_serializer_without_fields_stays_on_drf(backend):
     assert compiled == drf == {"pair": [1, 1]}
     drf, compiled = _both(lambda: Pair([1, 2], many=True), backend)
     assert compiled == drf == [{"pair": [1, 1]}, {"pair": [2, 2]}]
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_a_field_named_like_the_compilers_own_names_keeps_its_value(backend):
+    from fastdrf.testing import assert_compiled_as_drf
+    from tests.models import Collision
+
+    class Colliding(drf_serializers.ModelSerializer):
+        first = drf_serializers.IntegerField(source="number")
+        second = drf_serializers.IntegerField(source="number")
+        extra = drf_serializers.IntegerField(source="_fastdrf_1")
+        third = drf_serializers.IntegerField(source="number")
+        more = drf_serializers.IntegerField(source="_fastdrf_2")
+
+        class Meta:
+            model = Collision
+            fields = ["first", "second", "extra", "third", "more"]
+
+    assert_compiled_as_drf(
+        Colliding,
+        [Collision(id=1, number=1, _fastdrf_1=2, _fastdrf_2=3)],
+        backends=[backend],
+    )
+
+
+class OddInt(int):
+    def __int__(self):
+        return 99
+
+
+class OddFloat(float):
+    def __float__(self):
+        return 99.0
+
+
+class ReadOnlyNumber(drf_serializers.ModelSerializer):
+    number = drf_serializers.ReadOnlyField(source="id")
+
+    class Meta:
+        model = Edition
+        fields = ["number"]
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("many", [False, True])
+@pytest.mark.parametrize("value", [OddInt(1), 7])
+def test_a_read_only_number_is_output_unchanged(backend, many, value):
+    assert compiler.report(ReadOnlyNumber()) is None
+    edition = Edition(id=value)
+    source = [edition] if many else edition
+    expected = ReadOnlyNumber(source, many=many).data
+    with override_settings(FASTDRF={"SERIALIZER_BACKEND": backend}):
+        data = _data(ReadOnlyNumber(source, many=many))
+    assert data == expected
+    rows = data if many else [data]
+    assert [type(row["number"]) for row in rows] == [type(value)]

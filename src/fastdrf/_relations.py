@@ -1,10 +1,10 @@
 """Opt-in batching of unchanged DRF primary-key relation fields."""
 
-import copy
 import functools
 from collections.abc import Iterable, Iterator, Sequence
 from typing import Any
 
+from django.core.exceptions import EmptyResultSet
 from django.db import connections
 from django.db.models import IntegerField, QuerySet
 from django.db.models.query import ModelIterable
@@ -63,16 +63,20 @@ def _batchable_fields(serializer: Any, *, nested: bool) -> Iterator[Any]:
 
 def _is_batchable(field: Any) -> bool:
     # Only DRF's own classes, unchanged on the instance, and a ``pk_field``
-    # of DRF's (it converts the items once more when a lookup falls back).
+    # of DRF's, unchanged too (it converts the items once more when a lookup
+    # falls back, which only a conversion without effects allows).
     child = getattr(field, "child_relation", None)
-    return (
+    if not (
         type(field) is relations.ManyRelatedField
         and type(child) is relations.PrimaryKeyRelatedField
         and "to_internal_value" not in vars(field)
         and vars(child).keys().isdisjoint(("to_internal_value", "get_queryset"))
-        and (
-            child.pk_field is None or type(child.pk_field).__module__ == fields.__name__
-        )
+    ):
+        return False
+    pk_field = child.pk_field
+    return pk_field is None or (
+        type(pk_field).__module__ == fields.__name__
+        and "to_internal_value" not in vars(pk_field)
     )
 
 
@@ -101,11 +105,10 @@ def _batched_to_internal_value(field: Any, data: Any) -> list[Any]:
     seen = set()
     for item, key in zip(items, keys, strict=True):
         instance = found.get(key)
-        if instance is None:
+        if instance is None or key in seen:
+            # Not found, or found already: DRF gets a separate instance for
+            # every item, whose mutable values (a JSONField's) are its own.
             result.append(child.to_internal_value(item))
-        elif key in seen:
-            # DRF gets a separate instance for every item.
-            result.append(copy.copy(instance))
         else:
             seen.add(key)
             result.append(instance)
@@ -131,6 +134,14 @@ def _find_by_pk(child: Any, items: list[Any]) -> tuple[list[Any], dict[Any, Any]
         and not queryset.query.combinator
         # ``values()`` and ``values_list()`` rows are not instances.
         and queryset._iterable_class is ModelIterable
+        # A window is computed over the rows a query finds: over the
+        # filtered keys, not over the one row ``get()`` finds. Raw SQL may
+        # hold one.
+        and not queryset.query.extra
+        and not any(
+            getattr(annotation, "contains_over_clause", False)
+            for annotation in queryset.query.annotations.values()
+        )
     ):
         return keys, {}
     pk = queryset.model._meta.pk
@@ -173,7 +184,16 @@ def _find_by_pk(child: Any, items: list[Any]) -> tuple[list[Any], dict[Any, Any]
     found = {}
     duplicated = set()
     values = list(by_key.values())
-    size = _batch_size(queryset, len(values))
+    try:
+        size = _batch_size(queryset, len(values))
+    except EmptyResultSet:
+        # The queryset finds nothing (``none()``, an empty ``pk__in``):
+        # DRF's lookups report the first item.
+        return keys, {}
+    if size < 1:
+        # Not one key fits beside the queryset's own parameters: DRF's
+        # lookups, which need one, run and fail or succeed as in DRF.
+        return keys, {}
     for start in range(0, len(values), size):
         for instance in queryset.filter(pk__in=values[start : start + size]):
             if instance.pk in found:
@@ -188,19 +208,25 @@ def _find_by_pk(child: Any, items: list[Any]) -> tuple[list[Any], dict[Any, Any]
 def _batch_size(queryset: QuerySet[Any], count: int) -> int:
     """
     How many keys one ``pk__in`` query of ``queryset`` may hold on its
-    database: the connection's limits on query parameters and IN lists, less
-    the parameters of the queryset's own filters.
+    database: no more than its limit on an IN list, and no more than its
+    limit on query parameters less the queryset's own. 0 when none fits.
     """
     connection = connections[queryset.db]
-    limits = [
-        limit
-        for limit in (
-            connection.features.max_query_params,
-            connection.ops.max_in_list_size(),
-        )
-        if limit
-    ]
-    if not limits or count <= min(limits) // 2:
-        return max(count, 1)
-    _, params = queryset.query.get_compiler(queryset.db).as_sql()
-    return max(min(limits) - len(params), 1)
+    size = count
+    in_list = connection.ops.max_in_list_size()
+    if in_list:
+        size = min(size, in_list)
+    max_params = connection.features.max_query_params
+    if max_params:
+        size = min(size, max_params - _parameters(queryset))
+    return max(size, 0)
+
+
+def _parameters(queryset: QuerySet[Any]) -> int:
+    query = queryset.query
+    if not (query.where or query.annotations or query.extra):
+        # No filter, annotation or raw SQL: no parameters, and no need to
+        # compile the query, which costs as much as running it.
+        return 0
+    _, params = query.get_compiler(queryset.db).as_sql()
+    return len(params)

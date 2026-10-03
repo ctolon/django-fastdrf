@@ -19,6 +19,7 @@ relations, those are left out and read per object.
 import threading
 import weakref
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from django.core.exceptions import FieldDoesNotExist
@@ -29,7 +30,13 @@ from rest_framework import relations, serializers
 from fastdrf._field_cache import _static_fields
 from fastdrf.utils import depends_on_classification
 
-__all__ = ["auto_prefetch", "forget_lookups", "related_lookups"]
+__all__ = [
+    "LoadingPlan",
+    "auto_prefetch",
+    "explain",
+    "forget_lookups",
+    "related_lookups",
+]
 
 # Vendors whose backend refuses ``prefetch_related`` of a many-to-many
 # relation (django-mongodb-backend raises ``NotSupportedError``): such a
@@ -82,6 +89,82 @@ class _LookupCache:
 _lookup_cache = depends_on_classification(_LookupCache())
 
 
+def _traversable(queryset: QuerySet[Any], path: str) -> bool:
+    """
+    Whether ``select_related(path)`` keeps the queryset's ``only()`` or
+    ``defer()``: Django refuses to join a relation that is deferred. One that
+    is not joined is loaded as DRF loads it.
+    """
+    names, defer = queryset.query.deferred_loading
+    if not names:
+        return True
+    names = {_by_name(queryset.model, name) for name in names}
+    steps = path.split("__")
+    for depth in range(1, len(steps) + 1):
+        prefix = "__".join(steps[:depth])
+        if defer:
+            if prefix in names:
+                return False
+            continue
+        parent = "__".join(steps[: depth - 1])
+        # ``only()`` names the loaded fields of each level it names any of.
+        level = [name for name in names if name.rpartition("__")[0] == parent]
+        if (
+            level
+            and prefix not in names
+            and not any(name.startswith(prefix + "__") for name in names)
+        ):
+            return False
+    return True
+
+
+def _by_name(model: Any, lookup: str) -> str:
+    """``lookup`` with each foreign key column (``author_id``) as its field."""
+    steps = []
+    for step in lookup.split("__"):
+        try:
+            field = model._meta.get_field(step) if model is not None else None
+        except FieldDoesNotExist:
+            field = None
+        if field is not None and field.is_relation:
+            step = field.name
+            model = field.related_model
+        else:
+            model = None
+        steps.append(step)
+    return "__".join(steps)
+
+
+@dataclass(frozen=True)
+class LoadingPlan:
+    """
+    What :func:`auto_prefetch` adds to a queryset, and what it leaves out:
+    ``skipped`` holds ``(path, reason)`` for each derived join or lookup it
+    does not add. It is computed for one queryset and may hold that
+    request's ``Prefetch`` objects: it is not kept.
+    """
+
+    select_related: tuple[str, ...]
+    #: Added after the queryset's own lookups.
+    prefetch_related: tuple[Any, ...]
+    #: ``Prefetch`` objects that decide rows the queryset's own lookups reach,
+    #: placed before them, as Django requires.
+    first: tuple[Prefetch, ...]
+    skipped: tuple[tuple[str, str], ...]
+
+    def apply(self, queryset: QuerySet[Any]) -> QuerySet[Any]:
+        if self.select_related:
+            queryset = queryset.select_related(*self.select_related)
+        if self.first:
+            lookups = queryset._prefetch_related_lookups  # type: ignore[attr-defined]
+            queryset = queryset.prefetch_related(None).prefetch_related(
+                *self.first, *lookups
+            )
+        if self.prefetch_related:
+            queryset = queryset.prefetch_related(*self.prefetch_related)
+        return queryset
+
+
 def auto_prefetch(
     queryset: QuerySet[Any],
     serializer_class: type[serializers.BaseSerializer],
@@ -98,17 +181,47 @@ def auto_prefetch(
     ``Meta.prefetch`` is read from the serializer of *this* request, every
     time: a ``Prefetch`` with a queryset is the project's selection of rows,
     which may depend on the request and must not be kept for the next one.
+    :func:`explain` gives the same decisions with their reasons.
     """
+    return explain(queryset, serializer_class, get_serializer).apply(queryset)
+
+
+def explain(
+    queryset: QuerySet[Any],
+    serializer_class: type[serializers.BaseSerializer],
+    get_serializer: Callable[[], serializers.BaseSerializer],
+) -> LoadingPlan:
+    """The :class:`LoadingPlan` of :func:`auto_prefetch` for ``queryset``."""
+    skipped: list[tuple[str, str]] = []
     select, prefetch = _lookups_for(serializer_class, queryset.model, get_serializer)
+    if queryset.query.combinator or queryset._fields is not None:
+        # Django refuses joins and lookups after union(), intersection()
+        # and difference(): loaded as without auto_prefetch.
+        reason = (
+            "projected rows are not model instances"
+            if queryset._fields is not None
+            else f"Django does not load relations after {queryset.query.combinator}()"
+        )
+        paths = [
+            *select,
+            *(
+                lookup.prefetch_to if isinstance(lookup, Prefetch) else lookup
+                for lookup in prefetch
+            ),
+        ]
+        return LoadingPlan((), (), (), tuple((path, reason) for path in paths))
     if connections[queryset.db].vendor in _NO_MANY_TO_MANY_PREFETCH:
         # A ``Prefetch`` is the project's choice of rows: kept, and refused
         # by the backend as it would be without ``auto_prefetch``.
-        prefetch = [
-            lookup
-            for lookup in prefetch
-            if isinstance(lookup, Prefetch)
-            or not _crosses_many_to_many(queryset.model, lookup)
-        ]
+        kept = []
+        for lookup in prefetch:
+            if isinstance(lookup, Prefetch) or not _crosses_many_to_many(
+                queryset.model, lookup
+            ):
+                kept.append(lookup)
+            else:
+                skipped.append((lookup, "the database cannot prefetch it"))
+        prefetch = kept
 
     lookups = queryset._prefetch_related_lookups  # type: ignore[attr-defined]
     existing = {
@@ -116,38 +229,55 @@ def auto_prefetch(
         for lookup in lookups
     }
     # The view's own ``Prefetch`` of a relation stays its choice of rows.
-    chosen = {lookup.prefetch_to for lookup in lookups if isinstance(lookup, Prefetch)}
+    # Compared with joins, which name a reverse one-to-one by its query name.
+    chosen = {
+        _query_path(queryset.model, lookup.prefetch_to)
+        for lookup in lookups
+        if isinstance(lookup, Prefetch)
+    }
 
     def covered(path: str) -> bool:
         return any(seen == path or seen.startswith(path + "__") for seen in existing)
 
+    def under(path: str, prefetched: Any) -> bool:
+        return any(path == to or path.startswith(to + "__") for to in prefetched)
+
     explicit = [
-        lookup.prefetch_to for lookup in prefetch if isinstance(lookup, Prefetch)
+        _query_path(queryset.model, lookup.prefetch_to)
+        for lookup in prefetch
+        if isinstance(lookup, Prefetch)
     ]
-    # A join loads the relation first, and Django then skips the Prefetch.
-    select = [
-        path
-        for path in select
-        if not any(path == to or path.startswith(to + "__") for to in explicit)
-    ]
-    if select:
-        queryset = queryset.select_related(*select)
+    # A join loads the relation first, and Django then skips the Prefetch:
+    # the serializer's, and the queryset's own (a filtered Prefetch is the
+    # project's choice of rows; the join would bring the others back).
+    joined = []
+    for path in select:
+        if under(path, chosen):
+            skipped.append((path, "the queryset's Prefetch decides its rows"))
+        elif under(path, explicit):
+            skipped.append((path, "Meta.prefetch's Prefetch decides its rows"))
+        elif not _traversable(queryset, path):
+            skipped.append((path, "the queryset defers it"))
+        else:
+            joined.append(path)
     first = []
     missing = []
     for lookup in prefetch:
         path = lookup.prefetch_to if isinstance(lookup, Prefetch) else lookup
-        if isinstance(lookup, Prefetch) and path not in chosen and covered(path):
+        if (
+            isinstance(lookup, Prefetch)
+            and _query_path(queryset.model, path) not in chosen
+            and covered(path)
+        ):
             # Reached by a lookup of the view's (``"tags__books"``): the
             # Prefetch must come first to decide the rows, as Django requires.
             first.append(lookup)
         elif not covered(path):
             missing.append(lookup)
+        else:
+            skipped.append((path, "the queryset prefetches it"))
         existing.add(path)
-    if first:
-        queryset = queryset.prefetch_related(None).prefetch_related(*first, *lookups)
-    if missing:
-        queryset = queryset.prefetch_related(*missing)
-    return queryset
+    return LoadingPlan(tuple(joined), tuple(missing), tuple(first), tuple(skipped))
 
 
 def _lookups_for(
@@ -202,7 +332,24 @@ def related_lookups(
     if hints:
         prefetch.extend(_hints(serializer, ""))
     _collect(serializer, model, "", False, select, prefetch)
-    return select, prefetch
+    # Joins by query name; prefetches by attribute (a reverse relation's
+    # accessor), as Django names each.
+    return [_query_path(model, path) for path in select], prefetch
+
+
+def _query_path(model: Any, path: str) -> str:
+    """
+    ``path`` as ``select_related()`` names it: a reverse one-to-one by its
+    query name (``related_query_name``), not its accessor.
+    """
+    steps = []
+    for step in path.split("__"):
+        relation = _relation(model, step) if model is not None else None
+        if relation is not None and relation.auto_created and not relation.concrete:
+            step = relation.name
+        model = relation.related_model if relation is not None else None
+        steps.append(step)
+    return "__".join(steps)
 
 
 def _hints(serializer: Any, prefix: str) -> list[str | Prefetch]:
@@ -226,9 +373,16 @@ def _collect(
     in_prefetch: bool,
     select: list[str],
     prefetch: list[str | Prefetch],
+    path_to: tuple[tuple[type, type[Model]], ...] = (),
 ) -> None:
     if isinstance(serializer, serializers.ListSerializer):
         serializer = serializer.child
+    here = (type(serializer), model)
+    if here in path_to:
+        # A serializer nesting itself (a tree): its relation is loaded once,
+        # deeper levels as DRF loads them; its fields would never end.
+        return
+    path_to = (*path_to, here)
     if prefix:
         for hint in _hints(serializer, prefix):
             _add(prefetch, hint)
@@ -238,7 +392,7 @@ def _collect(
             continue
         if field.source == "*":
             if isinstance(field, serializers.BaseSerializer):
-                _collect(field, model, prefix, in_prefetch, select, prefetch)
+                _collect(field, model, prefix, in_prefetch, select, prefetch, path_to)
             continue
 
         path, related_model, many = _follow(model, field.source_attrs, prefix)
@@ -252,7 +406,15 @@ def _collect(
         else:
             _add(select, path)
         if isinstance(field, serializers.BaseSerializer):
-            _collect(field, related_model, path, many or in_prefetch, select, prefetch)
+            _collect(
+                field,
+                related_model,
+                path,
+                many or in_prefetch,
+                select,
+                prefetch,
+                path_to,
+            )
 
 
 def _follow(
@@ -268,11 +430,8 @@ def _follow(
     many = False
     current = model
     for attr in source_attrs:
-        try:
-            field = current._meta.get_field(attr)
-        except FieldDoesNotExist:
-            break
-        if not field.is_relation or field.related_model is None:
+        field = _relation(current, attr)
+        if field is None:
             break
         path = _join(path, attr)
         many = many or field.many_to_many or field.one_to_many
@@ -280,12 +439,39 @@ def _follow(
     return path, related_model, many
 
 
+def _relation(model: Any, attr: str) -> Any:
+    """
+    The relation an instance of ``model`` reads as its attribute ``attr``,
+    which ``select_related()`` and ``prefetch_related()`` name: a forward
+    relation by its name, a reverse one by its accessor (``edition_set``
+    without a ``related_name``). None for anything else.
+    """
+    for related in model._meta.related_objects:
+        if related.get_accessor_name() == attr:
+            return related
+    try:
+        field = model._meta.get_field(attr)
+    except FieldDoesNotExist:
+        return None
+    if (
+        not field.is_relation
+        or field.related_model is None
+        # A reverse relation by its query name, which is not an attribute.
+        or field.auto_created
+        and not field.concrete
+        # ``<fk>_id``: Django's get_field() gives the foreign key, but the
+        # instance holds the column, which no join loads.
+        or attr != field.name
+    ):
+        return None
+    return field
+
+
 def _crosses_many_to_many(model: type[Model], path: str) -> bool:
     current = model
     for attr in path.split("__"):
-        try:
-            field = current._meta.get_field(attr)
-        except FieldDoesNotExist:
+        field = _relation(current, attr)
+        if field is None:
             return False
         if field.many_to_many:
             return True

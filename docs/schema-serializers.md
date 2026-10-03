@@ -1,5 +1,13 @@
 # Schema serializers
 
+See [serializer usage examples](serializer-examples.md#pydantic-nested-schema-validation-and-aliases)
+for nested schemas, aliases, explicit patch schemas, context, model persistence,
+and form input with executable examples.
+For complete declarations of both libraries, including raw native APIs and
+DRF-style compiled backends, see [serializer styles](serializer-styles.md).
+For request/response handling in APIView and generic views, see
+[schema endpoint examples](view-examples.md#schemaviewmixin-with-apiview).
+
 `fastdrf.msgspec.serializers.MsgspecSerializer` and
 `fastdrf.pydantic.serializers.PydanticSerializer` are DRF serializers defined
 by a msgspec `Struct` or a pydantic `BaseModel`. The schema library validates
@@ -35,8 +43,8 @@ class BookSerializer(MsgspecSerializer):
 | `input_schema`, `output_schema` | Separate schemas for input and output; each falls back to `schema` when not set. |
 | `partial_schema` | The schema for `partial=True` input (see [partial updates](#partial-updates)). |
 | `model` | A Django model that `create()` and `update()` write. |
-| `strict` | msgspec: strict by default; `False` accepts `"12"` for an int, as DRF does. pydantic: lax by default; `True` turns on pydantic's strict mode. |
-| `dec_hook`, `enc_hook`, `schema_hook` | msgspec only: hooks for custom types in validation, output and the JSON Schema. |
+| `strict` | msgspec: strict by default; `False` accepts `"12"` for an int, as DRF does. pydantic: the model's own `strict` by default; `True` turns on pydantic's strict mode, `False` turns it off. |
+| `dec_hook`, `enc_hook`, `schema_hook` | msgspec only: hooks for custom types in validation, output and the JSON Schema. For every msgspec serializer, bare schemas of views included, register the type instead ([msgspec types](extending.md#msgspec-types)). |
 
 ## Behaviour
 
@@ -44,7 +52,10 @@ They are DRF serializers: `is_valid()`, `errors`, `validated_data`,
 `save()`, `data`, `many=True`, `context` and generic views work as usual.
 
 - `validated_data` is a dict of the schema's attributes, and
-  `serializer.validated_object` is the schema instance.
+  `serializer.validated_object` is the schema instance. Pydantic cached
+  properties are not input fields. Msgspec `UNSET` fields are omitted from
+  validated data in both full and partial requests, so missing optional
+  fields are not written to the model.
 - With `Meta.model`, `create()` and `update()` assign the fields as given (a
   foreign key as `author_id`) and set to-many relations after the save, as
   DRF's `ModelSerializer` does. Nested writes are not handled. Without a
@@ -56,18 +67,29 @@ They are DRF serializers: `is_valid()`, `errors`, `validated_data`,
   `RootModel`) are keyed by index.
 - Output is the output schema's. An instance of a subclass is represented
   with the schema's fields only, at every depth, and model instances are read
-  by attribute, so their relations must be loaded. pydantic uses
+  by attribute. A to-many relation is read as the list of its items, as DRF
+  reads `.all()`: prefetch it (`Meta.auto_prefetch` does not see schema
+  fields) or each instance queries it. pydantic uses
   serialization aliases and its field and model serializers; msgspec uses the
   Struct's `rename` and tag. A `RootModel`, an `array_like` Struct or a
   `model_serializer` keeps its array or scalar shape.
 - Datetimes follow the library's rules, not Django's time zone conversion.
 - `.fields` are read-only DRF fields describing the output schema, for
   `OrderingFilter`, `OPTIONS` metadata and the browsable API. Form input
-  (`QueryDict`) is validated with lenient coercion, and collection fields
-  keep repeated values.
+  (`QueryDict`) is validated with lenient coercion, a pydantic model's own
+  `strict` included. A field that takes a list (a collection, `Sequence`,
+  `deque`, or a union with one such as `list[str] | str`) is given the list
+  of its values, one value included; other fields get the last value, as
+  Django's `QueryDict` gives it.
 - `PydanticSerializer` passes the serializer's `context` to pydantic's
   validation and serialization callbacks (`info.context`), for `many=True`
   and partial output too.
+- Existing Pydantic model instances are serialized without revalidation,
+  for single and bulk output alike, including mixed lists of models and
+  input mappings. Mappings and attribute objects still need output validation.
+- Changes made by `validate()` keep their final representation even when
+  Python considers the replacement equal, such as `1` replaced by `True`
+  or `Decimal("1.0")` replaced by `Decimal("1.00")`.
 - `SERIALIZER_BACKEND` and `SERIALIZER_BACKEND_FALLBACK` do not apply to
   them.
 
@@ -79,7 +101,8 @@ runs none of the schema's own validation. With a msgspec `__post_init__`, an
 `array_like` Struct, pydantic validators, `model_post_init`,
 `validate_default` or a `RootModel`, set `Meta.partial_schema`; without it a
 partial update raises `ImproperlyConfigured`. A derived msgspec schema keeps
-the Struct's names, unknown-field policy and tag.
+the Struct's names, unknown-field policy and tag. A schema serializer nested
+in another serializer is partial when that serializer is, as DRF's fields are.
 
 Before a save, `.data` of partial input holds the given fields only,
 represented by the output schema. An output with a `model_serializer`, or an
@@ -104,20 +127,29 @@ represents plain children in one call;
 either one alone does both:
 
 ```python
+import msgspec
 from rest_framework import viewsets
 from rest_framework.views import APIView
 
+from catalog.models import Book
 from fastdrf.typed import SchemaViewMixin
+
+
+class BookIn(msgspec.Struct):
+    title: str
+    isbn: str
+    author_id: int
+
+
+class BookOut(msgspec.Struct):
+    id: int
+    title: str
 
 
 class BookViewSet(SchemaViewMixin, viewsets.ModelViewSet):
     queryset = Book.objects.all()
     input_schema = BookIn
     output_schema = BookOut
-
-    def perform_create(self, serializer):
-        book_in = serializer.validated_object  # a BookIn
-        serializer.save(owner=self.request.user)
 
 
 class NewBook(SchemaViewMixin, APIView):
@@ -129,6 +161,10 @@ class NewBook(SchemaViewMixin, APIView):
         book = Book.objects.create(**msgspec.structs.asdict(body))
         return self.schema_response(book, status=201)
 ```
+
+`Book` is the application's model from the usage guide. An integer `author_id`
+in a schema does not validate relationship access or model uniqueness; add those
+checks to the write contract before exposing this endpoint.
 
 - In a generic view, the serializer writes `queryset.model`: the view's
   `queryset` attribute, set on the class or given to `as_view()`. A
@@ -174,8 +210,22 @@ serializer for a schema.
 A schema serializer's backend describes its schemas:
 
 ```python
-body, components = BookSerializer().backend.json_schema(
-    Book, ref_prefix="#/components/schemas/", direction="response"
+import msgspec
+
+from fastdrf.msgspec.serializers import MsgspecSerializer
+
+
+class BookSchema(msgspec.Struct):
+    title: str
+
+
+class BookSchemaSerializer(MsgspecSerializer):
+    class Meta:
+        schema = BookSchema
+
+
+body, components = BookSchemaSerializer().backend.json_schema(
+    BookSchema, ref_prefix="#/components/schemas/", direction="response"
 )
 ```
 

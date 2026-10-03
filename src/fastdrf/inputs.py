@@ -24,6 +24,7 @@ times and UUID strings. Coercions and application validators remain DRF's.
 """
 
 import datetime
+import keyword
 import math
 import re
 import threading
@@ -201,6 +202,12 @@ def _field_type(
     field: Any, label: str, backend: str
 ) -> tuple[Any, Callable[[Any], Any] | None]:
     """Compile a value contract, including children without input names."""
+    if isinstance(field, serializers.BaseSerializer) and user_defines(
+        type(field), "get_default"
+    ):
+        # DRF asks a nested serializer missing from full input for its
+        # default: the method is the project's, with its own value.
+        raise NotCompilable(f"{label} overrides get_default()", code="custom_hook")
     if isinstance(field, serializers.ListSerializer):
         field_type, finish = _nested_list(field, label, backend)
     elif isinstance(field, serializers.BaseSerializer):
@@ -304,13 +311,31 @@ def _boolean(field: Any, label: str, backend: str) -> tuple[Any, None]:
 
 
 def _integer(field: Any, label: str, backend: str) -> tuple[Any, None]:
-    return _constrained(int, _constraints(field, label, numeric=True), backend), None
+    arguments = _constraints(field, label, numeric=True)
+    for name, round_ in (("ge", math.ceil), ("le", math.floor)):
+        limit = arguments.get(name)
+        if isinstance(limit, float):
+            # An integer is at least 1.5 when it is at least 2: the same bound,
+            # which the backends take for an integer only as an integer.
+            if not math.isfinite(limit):
+                raise NotCompilable(f"{label} has an infinite bound")
+            arguments[name] = round_(limit)
+    return _constrained(int, arguments, backend), None
 
 
 def _float(field: Any, label: str, backend: str) -> tuple[Any, Callable[[Any], Any]]:
-    # DRF rejects NaN and the infinities; msgspec does not.
+    # The bounds as DRF compares them: an int bound a float cannot hold
+    # (2**53 + 1) is rounded in the backend's constraint, which may then
+    # accept what DRF refuses.
+    low, high = field.min_value, field.max_value
+
     def finish(value: float) -> Any:
-        return value if math.isfinite(value) else NOT_RECOGNIZED
+        # DRF rejects NaN and the infinities; msgspec does not.
+        if not math.isfinite(value):
+            return NOT_RECOGNIZED
+        if (low is not None and value < low) or (high is not None and value > high):
+            return NOT_RECOGNIZED
+        return value
 
     return _constrained(
         float, _constraints(field, label, numeric=True), backend
@@ -378,7 +403,8 @@ def _uuid(field: Any, label: str, backend: str) -> tuple[Any, None]:
 def _date(field: Any, label: str, backend: str) -> tuple[Any, None]:
     if field.validators:
         raise NotCompilable(f"{label} has validators")
-    formats = getattr(field, "input_formats", None) or api_settings.DATE_INPUT_FORMATS
+    # As DRF reads it: an empty list given to the field reads no text.
+    formats = getattr(field, "input_formats", api_settings.DATE_INPUT_FORMATS)
     if list(formats) != [ISO_8601]:
         raise NotCompilable(f"{label} does not only read ISO 8601 dates")
     return _text_input(datetime.date, datetime.date.fromisoformat, backend), None
@@ -399,7 +425,8 @@ def _text_input(python_type: type, parse: Callable[[str], Any], backend: str) ->
 def _time(field: Any, label: str, backend: str) -> tuple[Any, Callable[[Any], Any]]:
     if field.validators:
         raise NotCompilable(f"{label} has validators")
-    formats = getattr(field, "input_formats", None) or api_settings.TIME_INPUT_FORMATS
+    # As DRF reads it: an empty list given to the field reads no text.
+    formats = getattr(field, "input_formats", api_settings.TIME_INPUT_FORMATS)
     if list(formats) != [ISO_8601]:
         raise NotCompilable(f"{label} does not only read ISO 8601 times")
 
@@ -533,6 +560,10 @@ def model_for(spec: "InputSpec", backend: str) -> Any:
 
     struct_fields: list[tuple[str, Any] | tuple[str, Any, Any]] = []
     for field in spec.fields:
+        if not field.name.isidentifier() or keyword.iskeyword(field.name):
+            # A Struct's fields are attributes: DRF validates the others
+            # (``display-name``).
+            raise NotCompilable(f"{field.name!r} is not a Python name")
         if field.optional:
             struct_fields.append(
                 (field.name, field.type | msgspec.UnsetType, msgspec.UNSET)
@@ -763,15 +794,12 @@ def _publish(
         return variants.setdefault(key, recognizer)
 
 
-# What DRF's validation calls on a serializer and on its fields.
+# What DRF's validation calls on a serializer, a list serializer and their
+# fields: the hooks refused on their classes, assigned to an instance.
 _INSTANCE_HOOKS = (
-    "run_validation",
-    "to_internal_value",
-    "run_validators",
-    "validate",
-    "get_value",
+    *_LIST_HOOKS,
+    *(name for pair in _ASYNC_PAIRS for name in pair),
     "get_default",
-    "validate_empty_values",
 )
 
 
@@ -864,7 +892,9 @@ def _field_signature(field: Any) -> tuple[Any, ...]:
             tuple((type(key), key) for key in field.choices),
         )
     if cls in (fields.DateField, fields.TimeField):
-        return (*common, tuple(getattr(field, "input_formats", None) or ()))
+        # Not given (the setting's) is not given empty.
+        formats = getattr(field, "input_formats", None)
+        return (*common, None if formats is None else tuple(formats))
     if cls in (fields.ListField, fields.DictField, fields.HStoreField):
         return (*common, field.allow_empty, _field_signature(field.child))
     if isinstance(field, serializers.ListSerializer):

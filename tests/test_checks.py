@@ -1,5 +1,6 @@
 """System checks, registered by the optional ``fastdrf`` app."""
 
+from importlib.util import find_spec
 from unittest import mock
 
 import pydantic
@@ -92,6 +93,33 @@ def test_the_app_registers_the_checks():
         registered = django_checks.registry.registry.get_checks()
         assert checks.check_settings in registered
         assert checks.check_serializer_backends in registered
+        assert checks.check_integrations in registered
         with override_settings(FASTDRF={"FIELD_COPY_MODE": "shallow"}):
             messages = django_checks.run_checks(tags=[django_checks.Tags.compatibility])
         assert "fastdrf.E001" in [message.id for message in messages]
+
+
+@pytest.mark.skipif(
+    not all(map(find_spec, ["django_countries", "djmoney", "phonenumber_field"])),
+    reason="the integrated packages",
+)
+def test_a_package_with_an_integration_not_installed_is_reported():
+    integrations = {
+        "phonenumber_field": "fastdrf.contrib.phonenumber",
+        "django_countries": "fastdrf.contrib.countries",
+        "djmoney": "fastdrf.contrib.money",
+    }
+    removed = list(integrations.values())
+    with override_settings(FASTDRF={"SERIALIZER_BACKEND": "msgspec"}):
+        assert checks.check_integrations(None) == []
+        # Installed means importable: django-phonenumber-field needs no app.
+        with modify_settings(INSTALLED_APPS={"remove": removed}):
+            infos = checks.check_integrations(None)
+    assert [info.id for info in infos] == ["fastdrf.I001"] * 3
+    assert all(isinstance(info, django_checks.Info) for info in infos)
+    assert {info.hint for info in infos} == {
+        f"Add {app!r} to INSTALLED_APPS." for app in removed
+    }
+    # Nothing is compiled: nothing to say.
+    with modify_settings(INSTALLED_APPS={"remove": removed}):
+        assert checks.check_integrations(None) == []

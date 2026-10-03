@@ -88,7 +88,7 @@ jobs:
         with:
           version: '0.12.13'
       - run: uv python install 3.12 3.14 3.14t
-      - run: uv run nox -s freethreaded tests_minimum tests_without_extras differential
+      - run: uv run nox -s freethreaded tests_minimum tests_without_extras differential contrib_install
 
   package:
     needs: approval

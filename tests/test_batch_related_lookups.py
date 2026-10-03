@@ -6,6 +6,8 @@ their order, the error and which item it names, and exceptions DRF lets
 through.
 """
 
+import sqlite3
+
 import pytest
 from django.core.exceptions import ImproperlyConfigured, MultipleObjectsReturned
 from django.db import connection
@@ -160,12 +162,12 @@ CASES = {
 ONE_QUERY = {
     "valid",
     "input order",
-    "duplicates",
     "strings",
     "float",
-    "html",
     "pk_field",
 }
+# One query for the distinct keys, and DRF's own for each repeated item.
+QUERIES = {"duplicates": 3, "html": 2}
 
 
 @pytest.fixture
@@ -186,6 +188,8 @@ def test_parity_with_drf(records, case):
     assert "to_internal_value" not in vars(serializer.fields["tags"])
     if case in ONE_QUERY:
         assert len(queries) == 1
+    if case in QUERIES:
+        assert len(queries) == QUERIES[case]
     assert len(queries) <= len(drf_queries)
 
 
@@ -224,14 +228,57 @@ def test_a_lookup_keeps_within_the_databases_parameter_limit(tags, monkeypatch):
         counts.append(len(params))
         return execute(sql, params, many, context)
 
-    # A method, so it holds on every connection; ``features.max_query_params``
-    # is cached per connection on some backends (PostgreSQL).
-    monkeypatch.setattr(type(connection.ops), "max_in_list_size", lambda self: 4)
+    # A property of the class, so it holds on every connection.
+    monkeypatch.setattr(
+        type(connection.features), "max_query_params", property(lambda self: 4)
+    )
     with override_settings(FASTDRF=ON), connection.execute_wrapper(count):
         assert _outcome(serializer_class(data=data)) == reference
     # Eight distinct keys; the filter's own parameter leaves three per query.
     assert counts[:3] == [4, 4, 3]
     assert max(counts) <= 4
+
+
+def test_an_in_list_limit_bounds_the_keys_not_the_parameters(tags, monkeypatch):
+    tags += [Tag.objects.create(name=name) for name in "defg"]
+    serializer_class = _serializer_class(queryset=Tag.objects.exclude(name="z"))
+    data = {"tags": [tag.pk for tag in tags]}
+    reference = _outcome(serializer_class(data=data))
+    counts = []
+
+    def count(execute, sql, params, many, context):
+        counts.append(len(params))
+        return execute(sql, params, many, context)
+
+    monkeypatch.setattr(type(connection.ops), "max_in_list_size", lambda self: 4)
+    with override_settings(FASTDRF=ON), connection.execute_wrapper(count):
+        assert _outcome(serializer_class(data=data)) == reference
+    # Seven keys, four per IN list, each with the filter's parameter.
+    assert counts == [5, 4]
+
+
+@pytest.mark.skipif(connection.vendor != "sqlite", reason="SQLite's own limit")
+def test_a_small_batch_counts_the_querysets_parameters(tags, monkeypatch):
+    serializer_class = _serializer_class(
+        queryset=Tag.objects.filter(name__in=["a", "b", "z"])
+    )
+    data = {"tags": _pks(tags, 0, 1)}
+    reference = _outcome(serializer_class(data=data))
+    assert reference[0] is True
+    connection.ensure_connection()
+    raw = connection.connection
+    previous = raw.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 4)
+    # Django before 6.0 does not read the connection's limit.
+    monkeypatch.setattr(
+        type(connection.features), "max_query_params", property(lambda self: 4)
+    )
+    try:
+        # Three of the filter's and two keys are five: DRF's lookups take
+        # four each.
+        with override_settings(FASTDRF=ON):
+            assert _outcome(serializer_class(data=data)) == reference
+    finally:
+        raw.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous)
 
 
 def test_a_join_that_duplicates_rows_raises_as_in_drf(tags):
@@ -359,6 +406,29 @@ def test_a_pk_field_of_the_project_is_called_as_by_drf(tags):
     assert calls == expected
 
 
+@pytest.mark.parametrize("data", [[0, 0], [0, 1, 0], [0, 998, 0]])
+def test_a_pk_field_method_assigned_to_the_instance_is_called_as_by_drf(tags, data):
+    def outcome():
+        calls = []
+        serializer = _serializer_class(pk_field=drf_serializers.IntegerField())(
+            data={"tags": [tags[i].pk if i < len(tags) else i for i in data]}
+        )
+        pk_field = serializer.fields["tags"].child_relation.pk_field
+        convert = pk_field.to_internal_value
+
+        def counted(value):
+            calls.append(value)
+            # A stateful converter: the third call gives another key.
+            return convert(value) if len(calls) < 3 else tags[2].pk
+
+        pk_field.to_internal_value = counted
+        return _outcome(serializer), calls
+
+    reference = outcome()
+    with override_settings(FASTDRF=ON):
+        assert outcome() == reference
+
+
 def test_a_setting_that_is_not_a_boolean_is_refused():
     with (
         override_settings(FASTDRF={"BATCH_RELATED_LOOKUPS": "yes"}),
@@ -399,3 +469,71 @@ def test_a_generic_create_saves_two_round_trips(tags):
     off = create("1")
     with override_settings(FASTDRF=ON):
         assert create("2") == off - 2
+
+
+@pytest.mark.parametrize(
+    "queryset",
+    [lambda: Tag.objects.none(), lambda: Tag.objects.filter(pk__in=[])],
+    ids=["none", "empty-in"],
+)
+def test_an_empty_queryset_reports_drfs_error_above_the_parameter_limit(
+    tags, monkeypatch, queryset
+):
+    # A limit on query parameters has the lookup measure the queryset's,
+    # which an empty queryset has no SQL for.
+    monkeypatch.setattr(type(connection.ops), "max_in_list_size", lambda self: 4)
+    serializer_class = _serializer_class(queryset=queryset())
+    data = {"tags": _pks(tags, 0, 1, 2) + [998, 999]}
+    reference = _outcome(serializer_class(data=data))
+    assert reference[0] is False
+    with override_settings(FASTDRF=ON):
+        assert _outcome(serializer_class(data=data)) == reference
+
+
+def test_a_window_is_computed_as_drf_computes_it(tags):
+    from django.db.models import F, Window
+    from django.db.models.functions import RowNumber
+
+    ranked = Tag.objects.annotate(
+        position=Window(expression=RowNumber(), order_by=F("id").asc())
+    )
+    serializer_class = _serializer_class(queryset=ranked)
+    data = {"tags": _pks(tags, 0, 1, 2)}
+
+    def positions():
+        serializer = serializer_class(data=data)
+        assert serializer.is_valid(), serializer.errors
+        return [(tag.pk, tag.position) for tag in serializer.validated_data["tags"]]
+
+    # Each item is DRF's get(pk=...): a window over one row.
+    reference = positions()
+    assert {position for _, position in reference} == {1}
+    with override_settings(FASTDRF=ON):
+        assert positions() == reference
+
+
+def test_repeated_items_hold_mutable_values_of_their_own(tags):
+    import datetime
+    import decimal
+    import uuid
+
+    from tests.models import Edition
+
+    author = Author.objects.create(name="Ursula")
+    book = Book.objects.create(title="t", isbn="1", author=author)
+    edition = Edition.objects.create(
+        code=uuid.uuid4(),
+        book=book,
+        published=datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC),
+        price=decimal.Decimal("1.00"),
+        format="hb",
+        extra={"items": []},
+    )
+    serializer_class = _serializer_class(queryset=Edition.objects.all())
+    with override_settings(FASTDRF=ON):
+        serializer = serializer_class(data={"tags": [edition.pk, edition.pk]})
+        assert serializer.is_valid(), serializer.errors
+    first, second = serializer.validated_data["tags"]
+    first.extra["items"].append("changed")
+    assert first is not second
+    assert second.extra == {"items": []}

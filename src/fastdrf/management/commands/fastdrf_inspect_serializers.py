@@ -46,8 +46,24 @@ class Command(BaseCommand):
             default=None,
             help="Defaults to FASTDRF['SERIALIZER_BACKEND'], or msgspec.",
         )
+        parser.add_argument(
+            "--registrations",
+            action="store_true",
+            help="List what fastdrf.registry holds instead of the serializers.",
+        )
 
-    def handle(self, *args, parity, backend, **options):
+    def handle(self, *args, **options):
+        try:
+            self._inspect(**options)
+        except ImproperlyConfigured as exc:
+            # FASTDRF, or a serializer of the project's, is misconfigured:
+            # the command's error, without a traceback.
+            raise CommandError(str(exc)) from exc
+
+    def _inspect(self, *, parity, backend, **options):
+        if options["registrations"]:
+            self._registrations(options["format"])
+            return
         if parity is None:
             parity = fastdrf_settings.SERIALIZER_BACKEND_PARITY
         if backend is None:
@@ -107,6 +123,7 @@ class Command(BaseCommand):
                             "eligible": result.eligible,
                             "code": result.code,
                             "reason": result.reason,
+                            "delegated": list(result.delegated),
                         }
                         for direction, result in directions.items()
                     },
@@ -266,9 +283,34 @@ class Command(BaseCommand):
             "error": str(exc),
         }
 
+    def _registrations(self, output_format):
+        from fastdrf.registry import registrations
+
+        records = [
+            {
+                "kind": entry.kind,
+                "target": f"{entry.target.__module__}.{entry.target.__qualname__}",
+                "options": list(entry.options),
+            }
+            for entry in registrations()
+        ]
+        if output_format == "json":
+            self.stdout.write(json.dumps(records, indent=2))
+            return
+        for record in records:
+            options = f" ({', '.join(record['options'])})" if record["options"] else ""
+            self.stdout.write(f"{record['kind']:<13}{record['target']}{options}")
+
     def _line(self, direction, result):
         if result.eligible:
-            self.stdout.write(self.style.SUCCESS(f"  {direction:<7}compiled"))
+            delegated = (
+                f"; delegated: {', '.join(result.delegated)}"
+                if result.delegated
+                else ""
+            )
+            self.stdout.write(
+                self.style.SUCCESS(f"  {direction:<7}compiled{delegated}")
+            )
         elif result.code == "schema_serializer":
             self.stdout.write(f"  {direction:<7}schema: {result.reason}")
         else:

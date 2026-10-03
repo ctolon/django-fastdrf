@@ -127,7 +127,8 @@ second and queries per request:
 $ python measure.py --seconds 2
 ```
 
-One run on Python 3.14, Django 6.1.1, DRF 3.18.1 and msgspec 0.21.1, with
+One run on the [reference machine](../../docs/benchmarks.md) (Intel Core
+i7-14700F), with Python 3.14, Django 6.1.1, DRF 3.18.1 and msgspec 0.21.1,
 every request in a rolled-back transaction:
 
 ```
@@ -138,7 +139,7 @@ POST article create                372         438   1.18x        8         6
 GET authors with articles           16          83   5.32x      249         3
 ```
 
-Absolute numbers depend on the machine. The ratios combine the query
+Absolute numbers depend on the machine: run `measure.py` on yours. The ratios combine the query
 reduction and the serializer and dispatch work; a DRF view with hand-written
 lookups would close part of the gap on the list endpoints.
 

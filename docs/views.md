@@ -1,5 +1,10 @@
 # Views and responses
 
+For endpoint implementations, routes, and backend-specific examples, see
+[API views and backend selection](view-examples.md).
+The [DRF view reference](drf-view-reference.md) includes every general-purpose
+DRF view class, with imports and URL patterns.
+
 All view classes in this document are mixins for DRF's `APIView`, generic
 views and viewsets. They change neither the status, content nor headers of a
 response; they skip work DRF repeats on every request, or release memory
@@ -166,8 +171,11 @@ is `None` (tests read `response.json()`), and there is no `render()` step, so
 
 It is rendered this way when the accepted renderer is exactly DRF's
 `JSONRenderer`, `fastdrf.renderers.JSONRenderer` or
-`fastdrf.msgspec.renderers.MsgspecJSONRenderer`, with no instance
-attributes. Otherwise, including for the browsable API, the view answers
+`fastdrf.msgspec.renderers.MsgspecJSONRenderer`,
+`fastdrf.pydantic.renderers.PydanticJSONRenderer`,
+`fastdrf.orjson.renderers.ORJSONRenderer`, or one registered with
+`fastdrf.registry.register_data_renderer()`
+([renderers](extending.md#renderers)), with no instance attributes. Otherwise, including for the browsable API, the view answers
 with DRF's `Response` built from the same data, headers, cookies and
 exception flag. A view whose `finalize_response` is the project's also gets
 DRF's `Response`, since that code may change `data` after DRF's

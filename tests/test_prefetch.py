@@ -19,7 +19,7 @@ from rest_framework.test import APIRequestFactory
 
 from fastdrf import prefetch
 from fastdrf.views import QueryOptimizationMixin
-from tests.models import Author, Book, Tag
+from tests.models import Author, Book, Edition, Node, Profile, Tag
 
 
 class AuthorSerializer(drf_serializers.ModelSerializer):
@@ -87,6 +87,10 @@ def get(view, path="/"):
 
 @pytest.mark.django_db
 def test_auto_prefetch_lookups_are_derived_once(library):
+    # Measure reuse after lazy contrib registration, which invalidates caches.
+    from fastdrf.utils import is_framework_class
+
+    is_framework_class(type(Book._meta.get_field("title")))
     prefetch.forget_lookups()
     with mock.patch.object(
         prefetch, "related_lookups", wraps=prefetch.related_lookups
@@ -94,6 +98,18 @@ def test_auto_prefetch_lookups_are_derived_once(library):
         for _ in range(3):
             assert get(Nested).status_code == 200
     assert related_lookups.call_count == 1
+
+
+@pytest.mark.parametrize("projection", ["values", "values_list"])
+def test_projected_querysets_have_no_added_relation_loading(projection):
+    queryset = getattr(Book.objects, projection)("title")
+    plan = prefetch.explain(queryset, NestedBookSerializer, NestedBookSerializer)
+    assert plan.select_related == ()
+    assert plan.prefetch_related == ()
+    assert plan.first == ()
+    assert plan.apply(queryset) is queryset
+    assert plan.skipped
+    assert all("projected rows" in reason for _, reason in plan.skipped)
 
 
 @pytest.mark.django_db
@@ -415,3 +431,317 @@ def test_prefetch_cache_does_not_own_serializer_or_model_classes(monkeypatch):
     del TemporarySerializer
     gc.collect()
     assert serializer() is None
+
+
+# -- The queryset's own choices ---------------------------------------------------
+
+
+class NullableAuthorBook(drf_serializers.ModelSerializer):
+    author = AuthorSerializer(allow_null=True)
+
+    class Meta:
+        model = Book
+        fields = ["id", "author"]
+        auto_prefetch = True
+
+
+def represent(queryset):
+    return NullableAuthorBook(queryset, many=True).data
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("path", ["author", "author__books"])
+def test_the_querysets_filtered_prefetch_is_not_replaced_by_a_join(kept, path):
+    # The rows a filtered Prefetch leaves out must stay out: a join would
+    # load the relation first, and Django would skip the Prefetch.
+    allowed = Author.objects.filter(name="allowed")
+    lookup = (
+        Prefetch("author", queryset=allowed)
+        if path == "author"
+        else Prefetch("author", queryset=allowed.prefetch_related("books"))
+    )
+    queryset = Book.objects.prefetch_related(lookup)
+    expected = represent(queryset.all())
+    optimized = prefetch.auto_prefetch(
+        queryset.all(), NullableAuthorBook, NullableAuthorBook
+    )
+    assert "author" not in (optimized.query.select_related or {})
+    assert represent(optimized) == expected == [{"id": 1, "author": None}]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "project",
+    [
+        lambda queryset: queryset.only("id", "title"),
+        lambda queryset: queryset.defer("author"),
+    ],
+)
+def test_a_deferred_foreign_key_is_not_joined(kept, project):
+    queryset = project(Book.objects.all())
+    expected = represent(queryset.all())
+    optimized = prefetch.auto_prefetch(
+        queryset.all(), NullableAuthorBook, NullableAuthorBook
+    )
+    assert represent(optimized) == expected
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "project",
+    [
+        lambda queryset: queryset.only("id", "title", "author"),
+        lambda queryset: queryset.only("id", "author__name"),
+        lambda queryset: queryset.defer("title"),
+    ],
+)
+def test_a_loaded_foreign_key_is_still_joined(kept, project, django_assert_num_queries):
+    optimized = prefetch.auto_prefetch(
+        project(Book.objects.all()), NullableAuthorBook, NullableAuthorBook
+    )
+    assert "author" in (optimized.query.select_related or {})
+    with django_assert_num_queries(1):
+        assert represent(optimized) == [
+            {"id": 1, "author": {"id": kept.pk, "name": "kept"}}
+        ]
+
+
+# -- Key columns ------------------------------------------------------------------------
+
+
+class AuthorIds(drf_serializers.ModelSerializer):
+    author_id = drf_serializers.IntegerField()
+    writer = drf_serializers.IntegerField(source="author_id")
+
+    class Meta:
+        model = Book
+        fields = ["id", "author_id", "writer"]
+        auto_prefetch = True
+
+
+@pytest.mark.django_db
+def test_a_key_column_is_not_a_join(kept, django_assert_num_queries):
+    optimized = prefetch.auto_prefetch(Book.objects.all(), AuthorIds, AuthorIds)
+    assert not optimized.query.select_related
+    with django_assert_num_queries(1):
+        assert AuthorIds(optimized, many=True).data == [
+            {"id": 1, "author_id": kept.pk, "writer": kept.pk}
+        ]
+
+
+@pytest.mark.django_db
+def test_a_key_column_through_a_relation_joins_the_relation_only(kept):
+    from tests.models import Edition
+
+    class EditionAuthors(drf_serializers.ModelSerializer):
+        author = drf_serializers.IntegerField(source="book.author_id")
+
+        class Meta:
+            model = Edition
+            fields = ["id", "author"]
+            auto_prefetch = True
+
+    optimized = prefetch.auto_prefetch(
+        Edition.objects.all(), EditionAuthors, EditionAuthors
+    )
+    assert optimized.query.select_related == {"book": {}}
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "project",
+    [
+        lambda queryset: queryset.defer("author_id"),
+        lambda queryset: queryset.only("id", "author_id"),
+        lambda queryset: queryset.only("id", "title"),
+    ],
+    ids=["defer-attname", "only-attname", "only-other"],
+)
+def test_a_key_named_by_its_column_is_deferred_or_loaded_alike(kept, project):
+    queryset = project(Book.objects.all())
+    expected = represent(queryset.all())
+    optimized = prefetch.auto_prefetch(
+        queryset.all(), NullableAuthorBook, NullableAuthorBook
+    )
+    assert represent(optimized) == expected
+
+
+# -- The plan ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_explain_names_what_is_loaded_and_what_is_left_and_why(kept):
+    allowed = Prefetch("author", queryset=Author.objects.filter(name="kept"))
+    queryset = Book.objects.prefetch_related(allowed)
+    plan = prefetch.explain(queryset, NestedBookSerializer, NestedBookSerializer)
+    assert plan.select_related == ()
+    assert plan.prefetch_related == ("tags",)
+    assert dict(plan.skipped) == {"author": "the queryset's Prefetch decides its rows"}
+    deferred = prefetch.explain(
+        Book.objects.only("id", "title"), NullableAuthorBook, NullableAuthorBook
+    )
+    assert dict(deferred.skipped) == {"author": "the queryset defers it"}
+
+
+@pytest.mark.django_db
+def test_auto_prefetch_applies_the_plan(kept):
+    queryset = Book.objects.all()
+    plan = prefetch.explain(queryset, NestedBookSerializer, NestedBookSerializer)
+    assert plan.select_related == ("author",)
+    applied = plan.apply(queryset)
+    automatic = prefetch.auto_prefetch(
+        queryset, NestedBookSerializer, NestedBookSerializer
+    )
+    assert applied.query.select_related == automatic.query.select_related
+    assert applied._prefetch_related_lookups == automatic._prefetch_related_lookups
+
+
+class TranslatedEdition(drf_serializers.ModelSerializer):
+    class Meta:
+        model = Edition
+        fields = ["id", "code"]
+
+
+class TranslatorEditions(drf_serializers.ModelSerializer):
+    # A reverse relation without related_name: DRF reads Django's default
+    # accessor, which prefetch_related() names too.
+    edition_set = TranslatedEdition(many=True, read_only=True)
+    book_count = drf_serializers.IntegerField(source="edition_set.count")
+
+    class Meta:
+        model = Author
+        fields = ["id", "edition_set", "book_count"]
+
+
+def test_a_default_reverse_accessor_is_prefetched():
+    assert prefetch.related_lookups(TranslatorEditions(), Author) == (
+        [],
+        ["edition_set"],
+    )
+    plan = prefetch.explain(
+        Author.objects.all(), TranslatorEditions, TranslatorEditions
+    )
+    assert plan.prefetch_related == ("edition_set",)
+
+
+class BookWithAuthor(drf_serializers.ModelSerializer):
+    author = AuthorSerializer(read_only=True)
+
+    class Meta:
+        model = Book
+        fields = ["id", "author"]
+        auto_prefetch = True
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("combine", ["union", "intersection", "difference"])
+def test_a_combined_queryset_is_left_as_it_is(combine):
+    author = Author.objects.create(name="a")
+    book = Book.objects.create(title="t", isbn="1", author=author)
+    first = Book.objects.filter(pk=book.pk)
+    queryset = getattr(first, combine)(Book.objects.filter(pk__gt=book.pk + 1000))
+    expected = BookWithAuthor(list(queryset), many=True).data
+    plan = prefetch.explain(queryset, BookWithAuthor, BookWithAuthor)
+    assert plan.select_related == ()
+    assert plan.prefetch_related == ()
+    assert [path for path, _ in plan.skipped] == ["author"]
+    loaded = prefetch.auto_prefetch(queryset, BookWithAuthor, BookWithAuthor)
+    assert BookWithAuthor(list(loaded), many=True).data == expected
+
+
+class ProfileNote(drf_serializers.ModelSerializer):
+    class Meta:
+        model = Profile
+        fields = ["note"]
+
+
+class AuthorProfile(drf_serializers.ModelSerializer):
+    profile = ProfileNote(read_only=True)
+    books = BookWithAuthor(many=True, read_only=True)
+
+    class Meta:
+        model = Author
+        fields = ["name", "profile", "books"]
+        auto_prefetch = True
+
+
+class BookAuthorProfile(drf_serializers.ModelSerializer):
+    author = AuthorProfile(read_only=True)
+
+    class Meta:
+        model = Book
+        fields = ["id", "author"]
+        auto_prefetch = True
+
+
+@pytest.mark.django_db
+def test_a_reverse_one_to_one_is_joined_by_its_query_name(
+    django_assert_num_queries,
+):
+    author = Author.objects.create(name="p")
+    Profile.objects.create(author=author, note="d")
+    Book.objects.create(title="t", isbn="1", author=author)
+    assert prefetch.related_lookups(AuthorProfile(), Author) == (
+        ["profile_query"],
+        ["books", "books__author"],
+    )
+    assert prefetch.related_lookups(BookAuthorProfile(), Book)[0] == [
+        "author",
+        "author__profile_query",
+    ]
+    for serializer_class, model in ((AuthorProfile, Author), (BookAuthorProfile, Book)):
+        expected = serializer_class(model.objects.all(), many=True).data
+        queryset = prefetch.auto_prefetch(
+            model.objects.all(), serializer_class, serializer_class
+        )
+        assert serializer_class(queryset, many=True).data == expected
+
+
+@pytest.mark.django_db
+def test_a_reverse_one_to_one_prefetch_of_the_querysets_decides_its_row():
+    author = Author.objects.create(name="p")
+    Profile.objects.create(author=author, note="hidden")
+    queryset = Author.objects.prefetch_related(
+        Prefetch("profile", queryset=Profile.objects.exclude(note="hidden"))
+    )
+    plan = prefetch.explain(queryset, AuthorProfile, AuthorProfile)
+    assert "profile_query" not in plan.select_related
+    loaded = plan.apply(queryset).get()
+    assert not hasattr(loaded, "profile") or loaded.profile is None
+
+
+class NodeTree(drf_serializers.ModelSerializer):
+    class Meta:
+        model = Node
+        fields = ["name"]
+        auto_prefetch = True
+
+    def get_fields(self):
+        fields = super().get_fields()
+        fields["children"] = NodeTree(many=True, read_only=True)
+        return fields
+
+
+class NodeSiblings(drf_serializers.ModelSerializer):
+    # The same class twice, side by side: neither is a cycle.
+    first = AuthorSerializer(source="author", read_only=True)
+    second = AuthorSerializer(source="author", read_only=True)
+
+    class Meta:
+        model = Book
+        fields = ["first", "second"]
+
+
+@pytest.mark.django_db
+def test_a_serializer_nesting_itself_is_followed_once():
+    root = Node.objects.create(name="root")
+    Node.objects.create(name="child", parent=root)
+    assert prefetch.related_lookups(NodeTree(), Node) == ([], ["children"])
+    queryset = Node.objects.filter(parent=None)
+    expected = NodeTree(queryset, many=True).data
+    loaded = prefetch.auto_prefetch(queryset, NodeTree, NodeTree)
+    assert NodeTree(loaded, many=True).data == expected
+
+
+def test_the_same_class_side_by_side_is_followed_each_time():
+    assert prefetch.related_lookups(NodeSiblings(), Book) == (["author"], [])

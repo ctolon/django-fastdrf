@@ -83,6 +83,8 @@ def struct_for(spec: OutputSpec) -> typing.Any:
     strings = []
     counts = collections.Counter(field.attribute for field in spec.fields)
     read: set[str] = set()
+    # Names of the compiler's own, none of them an attribute the Struct reads.
+    taken = set(counts)
     for index, field in enumerate(spec.fields):
         if counts[field.attribute] > 1:
             # ``from_attributes`` reads each attribute into one Struct field.
@@ -90,7 +92,11 @@ def struct_for(spec: OutputSpec) -> typing.Any:
             # once read, and are given the value the first one read; each is
             # then converted as it would be alone.
             if field.attribute in read:
-                name = f"_fastdrf_{index}"
+                name, again = f"_fastdrf_{index}", 0
+                while name in taken:
+                    again += 1
+                    name = f"_fastdrf_{index}_{again}"
+                taken.add(name)
                 fields.append((name, typing.Any, None))
             else:
                 name = field.attribute
@@ -197,15 +203,13 @@ def _complete(values: Sequence[typing.Any], plan: _Plan) -> None:
             if item is None:
                 continue
             if kind == "many":
-                items = msgspec.convert(
-                    list(related_items(item)), schema, from_attributes=True
-                )
+                items = _convert(list(related_items(item)), schema)
                 setattr(value, attribute, items)
                 if child_plan:
                     _complete(items, child_plan)
                 continue
             if kind == "one":
-                item = msgspec.convert(item, schema, from_attributes=True)
+                item = _convert(item, schema)
                 setattr(value, attribute, item)
             if child_plan:
                 _complete((item,), child_plan)
@@ -264,19 +268,28 @@ def _complete_columns(
     return True
 
 
+def _convert(value: typing.Any, schema: typing.Any) -> typing.Any:
+    # Some invalid strings raise UnicodeEncodeError instead of ValidationError.
+    # Normalize only native conversion failures, never application callbacks.
+    try:
+        return msgspec.convert(value, schema, from_attributes=True)
+    except UnicodeEncodeError as exc:
+        raise msgspec.ValidationError(str(exc)) from exc
+
+
 def build(spec: OutputSpec) -> Encoder:
     schema = struct_for(spec)
     many = list[schema]  # type: ignore[valid-type]  # built at runtime
     plan = _PLANS.get(schema)
 
     def dump(instance: typing.Any) -> typing.Any:
-        value = msgspec.convert(instance, schema, from_attributes=True)
+        value = _convert(instance, schema)
         if plan:
             _complete((value,), plan)
         return msgspec.to_builtins(value)
 
     def dump_many(instances: typing.Any) -> typing.Any:
-        values = msgspec.convert(instances, many, from_attributes=True)
+        values = _convert(instances, many)
         if plan:
             _complete(values, plan)
         return msgspec.to_builtins(values)

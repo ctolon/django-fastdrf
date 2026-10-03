@@ -199,6 +199,7 @@ def _eligible(field: fields.Field, *, allow_bound: bool = False) -> bool:
     kwargs = state["_kwargs"]
     return (
         type(field) in _SCALARS
+        and (allow_bound or _as_constructed(field))
         and (field.parent is None or allow_bound)
         and not state["_args"]
         and all(_plain(value) for name, value in kwargs.items() if name != "validators")
@@ -210,6 +211,64 @@ def _eligible(field: fields.Field, *, allow_bound: bool = False) -> bool:
             or validator.message.result is None
             for validator in state.get("_validators", ())
         )
+    )
+
+
+# What DRF's constructors of the ``_SCALARS`` set from an argument of the same
+# name, and the value they set without it (``rest_framework.fields``).
+_FROM_ARGUMENTS = {
+    "write_only": False,
+    "source": None,
+    "label": None,
+    "help_text": None,
+    "allow_null": False,
+    "allow_blank": False,
+    "trim_whitespace": True,
+    "max_length": None,
+    "min_length": None,
+    "max_value": None,
+    "min_value": None,
+}
+
+
+def _as_constructed(field: fields.Field) -> bool:
+    """
+    Whether ``field`` holds what its constructor gave it, read from its
+    arguments without building it: DRF copies a field by building it again,
+    so what was set on it afterwards (``field.trim_whitespace = False``) is
+    not in DRF's copies, and the scalar copy, which keeps the state, would
+    differ. Messages and arguments are compared by identity, so that no
+    lazy value is evaluated.
+    """
+    state = vars(field)
+    kwargs = state["_kwargs"]
+    for name, default in _FROM_ARGUMENTS.items():
+        if name in state and state[name] != kwargs.get(name, default):
+            return False
+    read_only = isinstance(field, fields.ReadOnlyField) or kwargs.get(
+        "read_only", False
+    )
+    if state.get("read_only") != read_only:
+        return False
+    if isinstance(field, fields.UUIDField) and state.get("uuid_format") != kwargs.get(
+        "format", "hex_verbose"
+    ):
+        return False
+    default = kwargs.get("default", fields.empty)
+    required = kwargs.get("required")
+    if required is None:
+        required = default is fields.empty and not read_only
+    if state.get("required") != required or state.get("default") is not default:
+        return False
+    if "style" not in kwargs and state.get("style") != {}:
+        return False
+    messages: dict[str, Any] = {}
+    for cls in reversed(type(field).__mro__):
+        messages.update(getattr(cls, "default_error_messages", {}))
+    messages.update(kwargs.get("error_messages") or {})
+    current = state.get("error_messages", {})
+    return current.keys() == messages.keys() and all(
+        current[key] is message for key, message in messages.items()
     )
 
 

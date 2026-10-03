@@ -27,8 +27,9 @@ This module imports neither library: ``fastdrf.msgspec.serializers`` and
 import datetime
 import importlib
 import threading
+import types
 import uuid
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import Any, ClassVar, NoReturn, Protocol
 
 from django.core.exceptions import ImproperlyConfigured
@@ -37,6 +38,7 @@ from django.utils.functional import cached_property
 from rest_framework import fields
 from rest_framework import serializers as drf
 from rest_framework.exceptions import ErrorDetail, ValidationError
+from rest_framework.fields import empty
 from rest_framework.settings import api_settings
 from rest_framework.utils import model_meta
 from rest_framework.utils.serializer_helpers import BindingDict, ReturnDict, ReturnList
@@ -83,30 +85,206 @@ class SchemaListSerializer(drf.ListSerializer):
         if method is not SchemaSerializer.to_representation:
             return super().to_representation(data)
         items = data.all() if isinstance(data, models.manager.BaseManager) else data
-        if data is getattr(self, "_validated_data", None):
-            if self.partial:
-                return [
-                    child.backend.dump_partial(child.get_output_schema(), item)
-                    for item in items
-                ]
-            # Child validation returns attribute-keyed dictionaries, even for
-            # array-like Structs and RootModels. Restore the input shape before
-            # converting to the output schema.
-            items = [
-                child.backend.from_values(child.get_input_schema(), item)
-                for item in items
-            ]
-        elif type(items) is not list:
+        state = self.__dict__
+        # ``_validated_data`` too: a caller that validates without
+        # run_validation() (aiodrf's asynchronous walk) sets it.
+        if data is state.get("_validated_value") or data is state.get(
+            "_validated_data"
+        ):
+            # Each item's schema object read in validation, found by the
+            # item itself (validate() may reorder, drop or add items), with
+            # what validate() changed: their callbacks do not run again. An
+            # item of validate()'s own, or partial input, has its fields only.
+            objects = {
+                id(values): (values, obj, read)
+                for values, obj, read in getattr(self, "_validated_objects", ())
+            }
+            represented = []
+            for item in items:
+                read = objects.get(id(item))
+                if child._is_partial() or read is None or read[0] is not item:
+                    represented.append(
+                        child.backend.dump_partial(child.get_output_schema(), item)
+                    )
+                else:
+                    represented.append(
+                        _represent_validated(child, read[1], item, read[2])
+                    )
+            return represented
+        if type(items) is not list:
             items = list(items)
-        return child.backend.dump_many(child.get_output_schema(), items)
+        schema = child.get_output_schema()
+        if items:
+            items = _readable_items(child.backend, schema, items, data)
+        return child.backend.dump_many(schema, items)
+
+    def to_internal_value(self, data: Any) -> Any:
+        self._validated_objects = []
+        return super().to_internal_value(data)
+
+    def run_validation(self, data: Any = empty) -> Any:
+        # What validation returned, by identity: ``validated_data`` at the
+        # top, or the value a parent serializer holds for this field, which
+        # DRF gives to_representation() when it represents its own.
+        value = super().run_validation(data)
+        self._validated_value = value
+        return value
+
+    def run_child_validation(self, data: Any) -> Any:
+        value = super().run_child_validation(data)
+        child = self.child
+        self._validated_objects.append(
+            (
+                value,
+                getattr(child, "_validated_object", None),
+                getattr(child, "_read_values", None),
+            )
+        )
+        return value
+
+
+class _Loaded:
+    """
+    A model instance as a schema reads it: a to-many relation it reads is
+    the list of the relation's items, as DRF's ``ListSerializer`` reads it
+    (from a prefetch, if any). A related instance that a nested schema reads
+    is read the same way; any other value is the instance's own (a field
+    typed as the model class gets the model instance).
+    """
+
+    __slots__ = ("_backend", "_instance", "_relations")
+
+    def __init__(
+        self, instance: models.Model, backend: Any, relations: dict[str, Any]
+    ) -> None:
+        self._instance = instance
+        self._backend = backend
+        self._relations = relations
+
+    def __getattr__(self, name: str) -> Any:
+        value = getattr(self._instance, name)
+        if name not in self._relations:
+            return value
+        nested = self._relations[name]
+        if isinstance(value, models.manager.BaseManager):
+            items = list(value.all())
+            if nested is None:
+                return items
+            return [_readable(self._backend, nested, item) for item in items]
+        if nested is not None:
+            return _readable(self._backend, nested, value)
+        return value
+
+
+def _readable(backend: Any, schema: Any, instance: Any) -> Any:
+    """``instance`` as ``schema`` reads it, a :class:`_Loaded` if need be."""
+    if not isinstance(instance, models.Model):
+        return instance
+    relations = _relations_read(backend, schema, type(instance))
+    return _Loaded(instance, backend, relations) if relations else instance
+
+
+def _relations_read(backend: Any, schema: Any, model: Any) -> dict[str, Any]:
+    relations = _relation_readers.cached((schema, model))
+    if relations is None:
+        relations = _relation_readers.get(
+            (schema, model), lambda: _read_relations(backend, schema, model)
+        )
+    return relations
+
+
+def _readable_items(backend: Any, schema: Any, items: list[Any], data: Any) -> Any:
+    """:func:`_readable` of each item, each model's relations looked up once."""
+    if isinstance(data, (models.QuerySet, models.manager.BaseManager)):
+        # A queryset's rows are of one model.
+        kinds = {type(items[0])}
+    else:
+        kinds = set(map(type, items))
+    plans = {
+        kind: relations
+        for kind in kinds
+        if issubclass(kind, models.Model)
+        and (relations := _relations_read(backend, schema, kind))
+    }
+    if not plans:
+        return items
+    return [
+        _Loaded(item, backend, plans[type(item)]) if type(item) in plans else item
+        for item in items
+    ]
+
+
+def _read_relations(
+    backend: Any, schema: Any, model: type[models.Model]
+) -> dict[str, Any]:
+    """
+    The relations of ``model`` that ``schema`` reads, each with the schema
+    of its values (a nested one), or None.
+    """
+    relations = {
+        # A reverse relation is read by its accessor (``edition_set``).
+        field.get_accessor_name()  # type: ignore[union-attr]
+        if field.auto_created and not field.concrete
+        else field.name
+        for field in model._meta.get_fields()
+        if field.is_relation
+    }
+    field_schemas = getattr(backend, "field_schemas", None)
+    if field_schemas is not None:
+        # What validation reads (an excluded field too), and what it holds.
+        read = field_schemas(schema)
+    else:
+        # A backend of another package: the output's fields, holding no schema.
+        read = dict.fromkeys(
+            spec.attribute or spec.name for spec in backend.field_specs(schema)
+        )
+    return {
+        attribute: nested
+        for attribute, nested in read.items()
+        if attribute in relations
+    }
+
+
+def _represent_validated(
+    serializer: Any, obj: Any, values: dict[str, Any], read: Any = None
+) -> Any:
+    """
+    ``values`` (validated data, what ``validate()`` returned) as DRF
+    represents them: the schema object ``obj`` read in validation when they
+    are its own, a copy of it with what ``validate()`` changed (its
+    callbacks do not run again), or the given fields only when it removed
+    one of them. ``read`` is a copy of the values read from ``obj``, kept
+    in validation, if any.
+    """
+    backend = serializer.backend
+    schema = serializer.get_output_schema()
+    current = read if read is not None else backend.values(obj, partial=False)
+    # Equality does not imply equal output: 1 == True and Decimal('1.0')
+    # == Decimal('1.00'). Preserve replacements without rerunning validation.
+    changes = {
+        name: value
+        for name, value in values.items()
+        if name not in current or current[name] is not value
+    }
+    if changes:
+        if not current.keys() <= values.keys():
+            return backend.dump_partial(schema, values)
+        if not values.keys() <= current.keys():
+            return backend.dump(schema, types.SimpleNamespace(**values))
+        obj = backend.with_values(obj, changes)
+    elif len(values) < len(current):
+        return backend.dump_partial(schema, values)
+    return backend.dump(schema, obj)
 
 
 class SchemaBackend(Protocol):
     """What a schema library provides to :class:`SchemaSerializer`."""
 
-    def load(self, schema: type, data: Any, *, strict: bool) -> Any: ...
+    def load(self, schema: type, data: Any, *, strict: bool | None) -> Any: ...
 
     def values(self, obj: Any, *, partial: bool) -> dict[str, Any]: ...
+
+    def with_values(self, obj: Any, changes: dict[str, Any]) -> Any: ...
 
     def from_values(self, schema: type, values: dict[str, Any]) -> Any: ...
 
@@ -125,7 +303,7 @@ class SchemaBackend(Protocol):
     def field_specs(self, schema: type) -> Iterable["FieldSpec"]: ...
 
     def validate(
-        self, schema: type, data: Any, *, partial: bool, strict: bool
+        self, schema: type, data: Any, *, partial: bool, strict: bool | None
     ) -> Any: ...
 
     def json_schema(
@@ -159,6 +337,17 @@ class SchemaSerializer(drf.Serializer):
         if isinstance(value, list):
             return ReturnList(value, serializer=self)
         return value
+
+    def get_initial(self) -> Any:
+        # DRF's: what was given for the fields that take input, which are
+        # the input schema's (the synthetic fields are read-only).
+        initial = getattr(self, "initial_data", None)
+        if not isinstance(initial, Mapping):
+            return super().get_initial()
+        names = set()
+        for spec in self.backend.field_specs(self.get_input_schema()):
+            names.update((spec.name, spec.attribute))
+        return {key: value for key, value in initial.items() if key in names}
 
     @classmethod
     def get_input_schema(cls) -> type:
@@ -233,8 +422,22 @@ class SchemaSerializer(drf.Serializer):
             )
         return self.backend.partial_schema(schema)
 
+    def run_validation(self, data: Any = empty) -> Any:
+        # See SchemaListSerializer.run_validation.
+        value = super().run_validation(data)
+        self._validated_value = value
+        return value
+
+    def _is_partial(self) -> bool:
+        # As DRF's fields read it: a nested serializer is partial with the
+        # serializer it belongs to, which DRF does not pass on.
+        if self.partial or self.parent is None:
+            return self.partial
+        return bool(getattr(self.root, "partial", False))
+
     def to_internal_value(self, data: Any) -> dict[str, Any]:
-        schema = self.get_partial_schema() if self.partial else self.get_input_schema()
+        partial = self._is_partial()
+        schema = self.get_partial_schema() if partial else self.get_input_schema()
         strict = self._strict()
         if hasattr(data, "getlist"):
             # A QueryDict from form input: strings, so lenient coercion. Keys
@@ -245,8 +448,11 @@ class SchemaSerializer(drf.Serializer):
             }
             strict = False
         obj = self.backend.load(schema, data, strict=strict)
+        values = self.backend.values(obj, partial=partial)
         self._validated_object = obj
-        return self.backend.values(obj, partial=self.partial)
+        # What validate() may change in place: compared in to_representation().
+        self._read_values = None if partial else dict(values)
+        return values
 
     @property
     def validated_object(self) -> Any:
@@ -263,21 +469,34 @@ class SchemaSerializer(drf.Serializer):
         return self._validated_object
 
     def to_representation(self, instance: Any) -> Any:
-        if instance is getattr(self, "_validated_data", None) and hasattr(
-            self, "_validated_object"
+        state = self.__dict__
+        if "_validated_object" in state and (
+            instance is state.get("_validated_value")
+            # Set without run_validation() too (aiodrf's asynchronous walk).
+            or instance is state.get("_validated_data")
         ):
-            # ``.data`` after ``is_valid()``, before a save: DRF represents
-            # validated_data, keyed by attribute; the schema object it came
-            # from reads the same, whatever the names on the wire. A partial
-            # one holds the given fields only, which the output schema
-            # represents alone: never DRF's walk, which knows none of its
-            # serializers, exclusions or nested schemas.
-            if self.partial:
-                return self.backend.dump_partial(
-                    self.get_output_schema(), self.validated_data
-                )
-            instance = self._validated_object
-        return self.backend.dump(self.get_output_schema(), instance)
+            # Validated data, before a save: ``.data`` after ``is_valid()``,
+            # or a parent's for this field. DRF represents it keyed by
+            # attribute; the schema object it came from reads the same,
+            # whatever the names on the wire. A partial one holds the given
+            # fields only, which the output schema represents alone: never
+            # DRF's walk, which knows none of its serializers, exclusions or
+            # nested schemas.
+            if self._is_partial():
+                return self.backend.dump_partial(self.get_output_schema(), instance)
+            return _represent_validated(
+                self, state["_validated_object"], instance, state.get("_read_values")
+            )
+        schema = self.get_output_schema()
+        backend = self.backend
+        if isinstance(instance, models.Model):
+            # Looked up here first: this runs for every output.
+            relations = _relation_readers.cached((schema, type(instance)))
+            if relations is None:
+                relations = _relations_read(backend, schema, type(instance))
+            if relations:
+                instance = _Loaded(instance, backend, relations)
+        return backend.dump(schema, instance)
 
     def create(self, validated_data: Any) -> Any:
         """Create ``Meta.model`` from the validated fields, if a model is set."""
@@ -306,7 +525,9 @@ class SchemaSerializer(drf.Serializer):
             getattr(instance, attr).set(validated_data[attr])
         return instance
 
-    def _strict(self) -> bool:
+    def _strict(self) -> bool | None:
+        # True: strict; False: lax (form input always is); None: the
+        # schema's own rule.
         return getattr(getattr(self, "Meta", None), "strict", True)
 
 
@@ -361,10 +582,11 @@ SCHEMA_CACHE_SIZE = 1024
 
 class BoundedCache:
     """
-    At most ``size`` values, built once per key.
+    At most ``size`` values, one published per key.
 
-    A hit takes no lock, which matters without the GIL; building and
-    evicting do, so two threads never build two classes for one key.
+    A hit takes no lock, which matters without the GIL. Building takes none
+    either, as it may use the cache again; publishing and evicting do, so
+    threads that built one key at once all get the first value published.
     Eviction is second-chance (CLOCK), the lock-free approximation of LRU:
     the oldest entry not used since the last sweep goes.
     """
@@ -381,13 +603,25 @@ class BoundedCache:
         if entry is not None:
             entry[1] = True
             return entry[0]
+        # Built outside the lock: building runs the project's code (a
+        # pydantic class hook, say), which may use this cache again.
+        value = build()
         with self._lock:
             entry = self._entries.get(key)
             if entry is None:
                 while len(self._entries) >= self.size:
                     self._evict()
-                entry = self._entries[key] = [build(), False]
+                entry = self._entries[key] = [value, False]
+            # Two threads may build; the first published value is everyone's.
             return entry[0]
+
+    def cached(self, key: Any, default: Any = None) -> Any:
+        """The value published for ``key``, or ``default``; never builds."""
+        entry = self._entries.get(key)
+        if entry is None:
+            return default
+        entry[1] = True
+        return entry[0]
 
     def _evict(self) -> None:
         for key, entry in list(self._entries.items()):
@@ -405,6 +639,10 @@ class BoundedCache:
 
     def __len__(self) -> int:
         return len(self._entries)
+
+
+# (output schema, model) -> the relations the schema reads (_read_relations).
+_relation_readers = BoundedCache(SCHEMA_CACHE_SIZE)
 
 
 class _SchemaClasses:
@@ -576,12 +814,16 @@ def error_detail(errors: Iterable[tuple[tuple[Any, ...], str, str]]) -> Any:
         node = root
         for key in path:
             node = node.setdefault(key, {})
-        node.setdefault("", []).append(ErrorDetail(message, code=code))
+        node.setdefault(_OWN, []).append(ErrorDetail(message, code=code))
     return _finalize(root, pad=False)
 
 
+# The key of a node's own errors: never a key of the input ("" can be one).
+_OWN = object()
+
+
 def _finalize(node: dict[Any, Any], pad: bool = True) -> Any:
-    leaf = node.pop("", None)
+    leaf = node.pop(_OWN, None)
     if not node:
         return leaf
     result = {key: _finalize(child) for key, child in node.items()}
@@ -589,7 +831,8 @@ def _finalize(node: dict[Any, Any], pad: bool = True) -> Any:
         result[api_settings.NON_FIELD_ERRORS_KEY] = leaf
     if (
         pad
-        and all(isinstance(key, int) for key in result)
+        # A missing item counted from the end has no place in a list.
+        and all(isinstance(key, int) and key >= 0 for key in result)
         # DRF 3.18 added the setting; earlier versions only pad.
         and not getattr(api_settings, "LIST_SERIALIZER_ERRORS_AS_DICT", False)
     ):

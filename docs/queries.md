@@ -46,6 +46,10 @@ request. A queryset that is not a `QuerySet` (a list, for example) is
 returned unchanged, and a view without a serializer class, such as a
 destroy-only view, is not inspected.
 
+No relation-loading steps are added to `values()` or `values_list()`
+querysets: their projected rows are not model instances. `explain()` reports
+the skipped steps; the original queryset and its own lookups stay unchanged.
+
 ### Explicit hints
 
 `Meta.prefetch` names relations the fields do not show, such as those a
@@ -70,7 +74,12 @@ class AuthorSerializer(serializers.ModelSerializer):
   `select_related` loads the relation, and it is placed before the view
   queryset's own lookups that go through it, as Django requires.
 - A `Prefetch` already on the view's queryset for the same relation takes
-  precedence over the serializer's.
+  precedence over the serializer's, and no derived `select_related` loads
+  that relation either: the join would bring back the rows its queryset
+  filters out.
+- A relation the view's queryset defers (`only()`, `defer()`, by its name or
+  its column) is not joined; it is loaded as without `auto_prefetch`. A
+  field reading a foreign key's column (`author_id`) needs no join.
 - The top-level `Meta.prefetch` is read from the serializer of each request
   and never cached, since a `Prefetch` queryset may depend on the request.
   In a nested serializer only string lookups are used, prefixed with the
@@ -83,6 +92,16 @@ and those relations are read per object.
 The functions behind the mixin are public: `fastdrf.prefetch.auto_prefetch`
 applies the lookups to a queryset, `related_lookups(serializer, model)`
 returns them, and `forget_lookups()` clears the cache.
+`explain(queryset, serializer_class, get_serializer)` returns the
+`LoadingPlan` that `auto_prefetch` applies (`plan.apply(queryset)`): its
+`select_related` and `prefetch_related`, and `skipped`, each derived lookup
+it leaves out with the reason:
+
+```python
+>>> plan = explain(Article.objects.only("id", "title"), ArticleSerializer, ArticleSerializer)
+>>> plan.skipped
+(('author', 'the queryset defers it'),)
+```
 
 ## Fetch mode
 
@@ -116,10 +135,15 @@ in one `pk__in` query during `is_valid()`:
 - Each item still resolves to its own model instance. An item the query
   does not find unambiguously goes through DRF's per-item lookup, in DRF's
   order, so the first failing item and its error are the ones DRF reports.
+  A repeated item does too, so that its instance and its mutable values (a
+  `JSONField`'s) are its own, as DRF's.
 - Nested serializers are batched when DRF's code alone builds their fields
   from their class; one with a `get_fields()` of the project's keeps DRF's
   per-item lookups.
-- `values()` and `values_list()` querysets are left to DRF.
+- `values()` and `values_list()` querysets, and querysets with a window
+  annotation or `extra()` SQL (computed over the rows a query finds, which
+  one `pk__in` query changes), are left to DRF. So is the lookup of a
+  queryset that finds nothing (`none()`).
 - The batching applies to the field instances of one validation and is
   removed when `is_valid()` returns or raises. Writes are not batched.
 

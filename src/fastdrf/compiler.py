@@ -24,8 +24,7 @@ to DRF's are accepted:
 * the column of a forward foreign key (``<fk>_id``), typed as its target field,
 * a dotted source through foreign keys that cannot be null,
 * a DRF scalar field reading a value of the instance alone (an annotation),
-* fields and keys registered by integrations (:data:`_FIELD_REPRESENTATIONS`,
-  :data:`_KEY_REPRESENTATIONS`, :data:`_DJANGO_READ_FIELDS`),
+* fields, keys and model fields registered with :mod:`fastdrf.registry`,
 * nested serializers for forward foreign keys, compiled recursively, and
   nested ``many=True`` serializers (DRF's own list serializer) for
   many-to-many fields and reverse foreign keys: ``manager.all()``, prefetched
@@ -67,7 +66,7 @@ import typing
 import uuid
 import weakref
 import zoneinfo
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from types import GetSetDescriptorType
 from typing import Any, cast
@@ -91,11 +90,18 @@ from django.utils.encoding import is_protected_type
 from rest_framework import ISO_8601, fields, relations, serializers
 from rest_framework.settings import api_settings
 
-from fastdrf._classify import has_async_representation, is_static
+from fastdrf._classify import (
+    _async_field,
+    _returns_coroutine,
+    has_async_representation,
+    is_static,
+)
 from fastdrf._compiled import fields_from_class
 from fastdrf.compat import BigIntegerField
 from fastdrf.settings import fastdrf_settings
+from fastdrf.signals import left_to_drf
 from fastdrf.utils import (
+    class_cache,
     definer,
     depends_on_classification,
     is_framework_class,
@@ -136,6 +142,8 @@ class Eligibility:
 
     code: str = "eligible"
     reason: str | None = None
+    #: The fields its own field represents in the compiled output.
+    delegated: tuple[str, ...] = ()
 
     @property
     def eligible(self) -> bool:
@@ -151,7 +159,16 @@ class OutputField:
     (DRF's own ``to_representation``); the backend then only encodes it.
     """
 
-    __slots__ = ("attribute", "convert", "key", "many", "nullable", "type")
+    __slots__ = (
+        "attribute",
+        "awaits",
+        "convert",
+        "delegated",
+        "key",
+        "many",
+        "nullable",
+        "type",
+    )
 
     def __init__(
         self,
@@ -161,6 +178,8 @@ class OutputField:
         nullable: bool,
         many: bool = False,
         convert: Callable[[Any], Any] | None = None,
+        delegated: bool = False,
+        awaits: bool = False,
     ) -> None:
         self.key = key
         self.attribute = attribute
@@ -168,6 +187,10 @@ class OutputField:
         self.nullable = nullable
         self.many = many
         self.convert = convert
+        # Represented by the serializer's own field (:func:`fill_delegated`),
+        # with a coroutine an asynchronous caller awaits (``awaits``).
+        self.delegated = delegated
+        self.awaits = awaits
 
 
 class OutputSpec:
@@ -176,6 +199,53 @@ class OutputSpec:
     def __init__(self, name: str, fields: list[OutputField]) -> None:
         self.name = name
         self.fields = fields
+
+    @property
+    def delegated(self) -> tuple[str, ...]:
+        """The delegated fields, those of nested serializers as ``key.field``."""
+        names = []
+        for field in self.fields:
+            if field.delegated:
+                names.append(field.key)
+            elif isinstance(field.type, OutputSpec):
+                names.extend(f"{field.key}.{name}" for name in field.type.delegated)
+        return tuple(names)
+
+    def delegation(self) -> "Delegation | None":
+        """
+        What :func:`fill_delegated` represents, or None. Nested ``many=True``
+        serializers are analyzed without delegation, so only those of
+        foreign keys have any.
+        """
+        entries: list[Any] = []
+        for field in self.fields:
+            if field.delegated:
+                entries.append(field.key)
+            elif (
+                isinstance(field.type, OutputSpec)
+                and (plan := field.type.delegation()) is not None
+            ):
+                entries.append((field.key, field.attribute, plan))
+        if not entries:
+            return None
+        awaits = any(field.awaits for field in self.fields if field.delegated) or any(
+            entry[2].awaits for entry in entries if not isinstance(entry, str)
+        )
+        return Delegation(tuple(entries), awaits)
+
+
+@dataclass(frozen=True, slots=True)
+class Delegation:
+    """
+    The delegated fields of a compiled output in DRF's field order: a field's
+    key, or ``(key, attribute, Delegation)`` for a serializer nested on a
+    foreign key that has delegated fields of its own.
+    """
+
+    entries: tuple[Any, ...]
+    #: Whether a field gives a coroutine, which only an asynchronous caller
+    #: awaits (``compiled_for(..., awaits=True)``).
+    awaits: bool = False
 
 
 _INTEGERS = {
@@ -214,18 +284,31 @@ _SCALARS = (
 )
 _BIG_INTEGER = BigIntegerField
 
-# Registered by integrations, for the fields of packages they support (an
-# ``ObjectId`` field of a MongoDB backend), at start-up, before serializers
-# are compiled. Each representation is the field's ``to_representation`` of
-# a value that is not None, without the field.
-#: Serializer field class (the definer of its ``to_representation``) -> the
-#: representation of a model column's value.
-_FIELD_REPRESENTATIONS: dict[type | None, Any] = {}
-#: Primary key relation class -> the representation of a related key.
-_KEY_REPRESENTATIONS: dict[type | None, Any] = {}
-#: Model field classes of other packages that Django's descriptor reads, with
-#: no code of their own at read time.
-_DJANGO_READ_FIELDS: set[type] = set()
+
+@dataclass(frozen=True, slots=True)
+class _Registration:
+    """
+    A field class registered with :mod:`fastdrf.registry`: the options its
+    output depends on, which the variant :func:`signature` keeps, and the
+    factory of its representation of a value that is not None (None to keep
+    the serializer on DRF).
+    """
+
+    #: ``(attribute, key function or None)``.
+    options: tuple[tuple[str, Callable[[Any], Any] | None], ...]
+    representation: Callable[[Any], Callable[[Any], Any] | None]
+
+
+# Filled by :mod:`fastdrf.registry`, at start-up, before serializers are
+# compiled; a registration forgets what was compiled before it.
+#: Serializer field class (the definer of its ``to_representation``) -> its
+#: registration, for a model column's value.
+_FIELD_REPRESENTATIONS: dict[type, _Registration] = {}
+#: Primary key relation class -> its registration, for a related key.
+_KEY_REPRESENTATIONS: dict[type, _Registration] = {}
+#: Model field classes of other packages whose descriptor (None for
+#: Django's) runs no code with effects at read time -> that descriptor class.
+_DJANGO_READ_FIELDS: dict[type, type | None] = {}
 _BY_INTERNAL_TYPE = {
     internal: python_type
     for _, python_type, internals in _SCALARS
@@ -249,6 +332,8 @@ _FIELD_ATTRS = (
     "normalize_output",
     "slug_field",
     "use_url",
+    # A SerializerMethodField's method decides whether it can be delegated.
+    "method_name",
 )
 _ABSENT = object()
 
@@ -262,13 +347,27 @@ def _option(field: Any, attr: str) -> Any:
 
 
 def analyze(
-    serializer: serializers.BaseSerializer, parity: str = "strict"
+    serializer: serializers.BaseSerializer,
+    parity: str = "strict",
+    delegate: bool = False,
+    awaits: bool = False,
 ) -> "OutputSpec":
-    """Return the :class:`OutputSpec` of ``serializer`` or raise NotCompilable."""
+    """
+    Return the :class:`OutputSpec` of ``serializer`` or raise NotCompilable.
+    With ``delegate``, a field the backend cannot represent is represented by
+    its own code (:func:`fill_delegated`) instead; nested serializers are
+    analyzed without, so a nested one that cannot be compiled is a field
+    represented by its own code as a whole. With ``awaits`` a delegated
+    field may give a coroutine, for an asynchronous caller.
+    """
     cls = type(serializer)
     if _custom(cls, "to_representation"):
         raise NotCompilable(
             f"{cls.__qualname__} overrides to_representation()", code="custom_hook"
+        )
+    if awaits and user_defines(cls, "ato_representation", "adata"):
+        raise NotCompilable(
+            f"{cls.__qualname__} represents itself asynchronously", code="custom_hook"
         )
     meta = getattr(serializer, "Meta", None)
     model = getattr(meta, "model", None)
@@ -280,22 +379,187 @@ def analyze(
     output = []
     for field in serializer._readable_fields:  # type: ignore[attr-defined]
         name = f"{cls.__qualname__}.{field.field_name}"
-        if field.source == "*":
-            raise NotCompilable(
-                f"{name} has source={field.source!r}", code="unsupported_source"
-            )
-        if _custom(type(field), "get_attribute"):
-            raise NotCompilable(f"{name} overrides get_attribute()", code="custom_hook")
-        output.append(_output_field(field, name, model, parity))
-
-    if parity == "strict":
-        for output_field in output:
-            if not _instance_only(model, output_field.attribute):
-                _check_framework_read(model, output_field.attribute)
+        try:
+            output.append(_compiled_field(field, name, model, parity, delegate, awaits))
+        except NotCompilable:
+            if not delegate or model is None:
+                raise
+            # DRF's code for this field, in the compiled output.
+            output.append(_delegated(field, name, model, awaits))
+    if output and all(output_field.delegated for output_field in output):
+        raise NotCompilable(
+            f"{cls.__qualname__} has no field the backend represents",
+            code="nothing_compiled",
+        )
     return OutputSpec(f"{cls.__name__}Compiled", output)
 
 
-def _output_field(field: Any, name: str, model: Any, parity: str) -> OutputField:
+def _compiled_field(
+    field: Any, name: str, model: Any, parity: str, delegate: bool, awaits: bool
+) -> OutputField:
+    if field.source == "*":
+        raise NotCompilable(
+            f"{name} has source={field.source!r}", code="unsupported_source"
+        )
+    if _custom(type(field), "get_attribute"):
+        raise NotCompilable(f"{name} overrides get_attribute()", code="custom_hook")
+    output_field = _output_field(field, name, model, parity, delegate, awaits)
+    if parity == "strict" and not _instance_only(model, output_field.attribute):
+        _check_framework_read(model, output_field.attribute)
+    return output_field
+
+
+def _delegated(field: Any, name: str, model: Any, awaits: bool) -> OutputField:
+    """
+    A field the serializer's own field represents, after the compiled
+    output: the compiled class holds its key, in DRF's order, and reads
+    ``_state``, which every model instance has, in its place. A field that
+    gives a coroutine is delegated for an asynchronous caller only; a nested
+    serializer whose representation awaits cannot be (DRF's synchronous code
+    would leave its coroutines unawaited).
+    """
+    if isinstance(field, serializers.BaseSerializer):
+        if has_async_representation(field):
+            raise NotCompilable(
+                f"{name} is a serializer represented asynchronously",
+                code="custom_hook",
+            )
+        waits = False
+    else:
+        if _returns_coroutine(field.get_attribute):
+            raise NotCompilable(
+                f"{name} reads its value with a coroutine", code="custom_hook"
+            )
+        waits = _async_field(field.parent, field, model)
+    if waits and not awaits:
+        hook = (
+            getattr(field.parent, field.method_name, None)
+            if isinstance(field, fields.SerializerMethodField)
+            else field.to_representation
+        )
+        what = getattr(hook, "__qualname__", None) or "its source"
+        raise NotCompilable(
+            f"{name} is represented by a coroutine, {what}()", code="custom_hook"
+        )
+    return OutputField(
+        field.field_name,
+        "_state",
+        typing.Any,
+        True,
+        convert=_held_in_place,
+        delegated=True,
+        awaits=waits,
+    )
+
+
+def _held_in_place(value: Any) -> None:
+    return None
+
+
+#: What :meth:`DelegatedStep.read` returns once the step is done (a skipped
+#: field, or None as None).
+DONE = object()
+
+
+class DelegatedStep:
+    """
+    One delegated field of one item, as DRF's ``Serializer.to_representation``
+    represents it: :meth:`read` its attribute, :meth:`represent` it, and
+    :meth:`write` the result. A synchronous caller does it in a row
+    (:func:`fill_delegated`); an asynchronous one awaits what is awaitable.
+    """
+
+    __slots__ = ("field", "instance", "row")
+
+    def __init__(self, row: dict[str, Any], field: Any, instance: Any) -> None:
+        self.row = row
+        self.field = field
+        self.instance = instance
+
+    def read(self) -> Any:
+        """The field's attribute, or :data:`DONE` (skipped, or None)."""
+        try:
+            attribute = self.field.get_attribute(self.instance)
+        except fields.SkipField:
+            del self.row[self.field.field_name]
+            return DONE
+        check = (
+            attribute.pk if isinstance(attribute, relations.PKOnlyObject) else attribute
+        )
+        if check is None:
+            self.row[self.field.field_name] = None
+            return DONE
+        return attribute
+
+    def represent(self, attribute: Any) -> Any:
+        if attribute is None:
+            # An awaited attribute that was None: DRF's None check, after it.
+            return None
+        return self.field.to_representation(attribute)
+
+    def write(self, value: Any) -> None:
+        self.row[self.field.field_name] = value
+
+
+def delegated_steps(
+    serializer: serializers.BaseSerializer,
+    delegation: "Delegation",
+    items: list[Any],
+    rows: list[dict[str, Any]],
+) -> Iterator[DelegatedStep]:
+    """
+    The delegated fields of ``serializer`` (the child of a list) for
+    ``items`` and their compiled ``rows``, item by item and in field order,
+    a serializer nested on a foreign key at its place, for a related object
+    that has a row. Each step is taken before the next is made.
+    """
+    live = _live_fields(serializer, delegation)
+    for row, instance in zip(rows, items, strict=True):
+        yield from _row_steps(live, row, instance)
+
+
+def fill_delegated(
+    serializer: serializers.BaseSerializer,
+    delegation: "Delegation",
+    items: list[Any],
+    rows: list[dict[str, Any]],
+) -> None:
+    """Take every :func:`delegated_steps` step synchronously."""
+    for step in delegated_steps(serializer, delegation, items, rows):
+        attribute = step.read()
+        if attribute is not DONE:
+            step.write(step.represent(attribute))
+
+
+def _live_fields(serializer: Any, delegation: "Delegation") -> list[Any]:
+    fields_ = serializer.fields
+    return [
+        (fields_[entry],)
+        if isinstance(entry, str)
+        else (entry[0], entry[1], _live_fields(fields_[entry[0]], entry[2]))
+        for entry in delegation.entries
+    ]
+
+
+def _row_steps(live: list[Any], row: dict[str, Any], instance: Any) -> Iterator[Any]:
+    for entry in live:
+        if len(entry) == 3:
+            key, attribute, nested = entry
+            nested_row = row.get(key)
+            if nested_row is not None:
+                yield from _row_steps(nested, nested_row, getattr(instance, attribute))
+            continue
+        yield DelegatedStep(row, entry[0], instance)
+
+
+def _output_field(
+    field: Any,
+    name: str,
+    model: Any,
+    parity: str,
+    delegate: bool = False,
+    awaits: bool = False,
+) -> OutputField:
     """The :class:`OutputField` of one readable field, or raise NotCompilable."""
     if len(field.source_attrs) > 1:
         return _through_relations(field, name, model, parity)
@@ -326,7 +590,9 @@ def _output_field(field: Any, name: str, model: Any, parity: str) -> OutputField
         ):
             raise NotCompilable(f"{name} is not a forward foreign key")
         _check_related_model(name, field, model_field.related_model)
-        nested = analyze(field, parity)
+        # The related object is read once and kept by Django: its delegated
+        # fields read it again without a query (a related manager would).
+        nested = analyze(field, parity, _delegates(field, delegate), awaits)
         return OutputField(field.field_name, attribute, nested, True)
     if isinstance(field, fields.ModelField):
         return _model_field_output(field, name, model_field, parity)
@@ -338,15 +604,48 @@ def _output_field(field: Any, name: str, model: Any, parity: str) -> OutputField
         return _primary_key(field, name, model, model_field, parity)
     if model_field is None and _instance_only(model, attribute):
         return _instance_value(field, name, attribute)
-    represent = _FIELD_REPRESENTATIONS.get(definer(type(field), "to_representation"))
-    if represent is not None:
+    registration = _FIELD_REPRESENTATIONS.get(definer(type(field), "to_representation"))
+    if registration is not None:
         if model_field is None or model_field.is_relation:
             raise NotCompilable(f"{name} is not a column of the model")
+        convert = _registered_representation(registration, field, name)
         return OutputField(
-            field.field_name, attribute, typing.Any, True, convert=represent
+            field.field_name, attribute, typing.Any, True, convert=convert
         )
+    if _holds_objects(model, _column_field(model_field, attribute), attribute):
+        # A package's model field (a phone number, a country) may give its
+        # own objects, which DRF's field converts like an instance's value.
+        return _instance_value(field, name, attribute)
 
     return _scalar(field, name, model_field, attribute, parity)
+
+
+def _holds_objects(model: Any, column: Any, attribute: str) -> bool:
+    """
+    Whether the column of ``attribute`` may hold objects of its model field's
+    own, loaded or not: the field converts what the database returns, or
+    its descriptor is not Django's.
+    """
+    if column is None or is_framework_class(type(column)):
+        return False
+    if user_defines(type(column), "from_db_value"):
+        return True
+    descriptor = inspect.getattr_static(model, attribute, None)
+    return not (
+        isinstance(descriptor, DeferredAttribute)
+        and is_framework_class(type(descriptor))
+    )
+
+
+def _registered_representation(
+    registration: _Registration, field: Any, name: str
+) -> Callable[[Any], Any]:
+    convert = registration.representation(field)
+    if convert is None:
+        raise NotCompilable(
+            f"{name} is a {type(field).__name__} its registration declines"
+        )
+    return convert
 
 
 def _scalar(
@@ -366,6 +665,14 @@ def _scalar(
         # ``str(value)``: a subclass (an enum member) may render otherwise
         # than the value the backends would output.
         python_type, convert = typing.Any, _exact_string
+    elif (
+        parity == "strict"
+        and python_type is int
+        and type(field) is fields.ReadOnlyField
+    ):
+        # DRF outputs the value itself: a subclass of int (an enum member)
+        # stays one in ``.data``, which the backends would make an int.
+        python_type, convert = typing.Any, _exact_integer
     # DRF represents None as None whatever the field: an unsaved instance's
     # id, a value the project set.
     return OutputField(field.field_name, attribute, python_type, True, convert=convert)
@@ -513,6 +820,12 @@ def _unchanged_raw(value: Any) -> Any:
     raise UnreadableValue(f"{value!r} is not a string or an integer")
 
 
+def _exact_integer(value: Any) -> int:
+    if type(value) is int:
+        return value
+    raise UnreadableValue(f"{value!r} is not an int")
+
+
 def _exact_string(value: Any) -> str:
     if type(value) is str:
         return value
@@ -565,6 +878,7 @@ def _primary_keys(
             field.field_name, attribute, typing.Any, True, convert=_key_list(convert)
         )
     target = _column_field(related_model._meta.pk, related_model._meta.pk.attname)
+    _check_plain_key(name, target)
     python_type = _BY_INTERNAL_TYPE.get(target.get_internal_type())
     if python_type is None:
         raise NotCompilable(f"{name} points to a {target.get_internal_type()} key")
@@ -633,6 +947,7 @@ def _slug_column(field: Any, name: str, related_model: Any, parity: str) -> str:
             f"{name} outputs {related_model.__name__}.{slug}, which is not a column",
             code="unsupported_source",
         )
+    _check_plain_key(name, model_field)
     python_type = _BY_INTERNAL_TYPE.get(model_field.get_internal_type())
     if python_type is None:
         raise NotCompilable(f"{name} outputs a {model_field.get_internal_type()}")
@@ -640,6 +955,20 @@ def _slug_column(field: Any, name: str, related_model: Any, parity: str) -> str:
     if parity == "strict":
         _check_framework_read(related_model, slug)
     return slug
+
+
+def _check_plain_key(name: str, model_field: Any) -> None:
+    """
+    Raise NotCompilable for a key or slug field that converts what the
+    database returns: its values may be objects of its own (a ``str``
+    subclass), which DRF outputs unchanged and the backends cannot.
+    """
+    if not is_framework_class(type(model_field)) and user_defines(
+        type(model_field), "from_db_value"
+    ):
+        raise NotCompilable(
+            f"{name} reads a {type(model_field).__name__}, which converts its values"
+        )
 
 
 def _through_relations(field: Any, name: str, model: Any, parity: str) -> OutputField:
@@ -701,6 +1030,9 @@ def _through_relations(field: Any, name: str, model: Any, parity: str) -> Output
     if parity == "strict":
         _check_framework_read(current, attribute)
     if isinstance(field, fields.ReadOnlyField):
+        # Read through a relation, the value cannot be given to DRF to
+        # render: in either parity, only values the backends render as DRF.
+        _check_raw_value(name, python_type, "strict")
         represent: Callable[[Any], Any] = _unchanged_raw
     elif python_type is datetime.datetime:
         represent = _datetime_representation(field)
@@ -741,6 +1073,8 @@ def _check_framework_read(model: Any, attribute: str) -> None:
     """
     where = f"{model.__name__}.{attribute}"
     descriptor = inspect.getattr_static(model, attribute, None)
+    if _registered_read(model, attribute, descriptor):
+        return
     if not (
         isinstance(descriptor, (DeferredAttribute, *_RELATION_DESCRIPTORS))
         and is_framework_class(type(descriptor))
@@ -749,7 +1083,10 @@ def _check_framework_read(model: Any, attribute: str) -> None:
             f"{where} is read by {type(descriptor).__name__}", code="custom_hook"
         )
     field: Any = descriptor.field
-    if not (is_framework_class(type(field)) or type(field) in _DJANGO_READ_FIELDS):
+    if not (
+        is_framework_class(type(field))
+        or _DJANGO_READ_FIELDS.get(type(field), 0) is None
+    ):
         raise NotCompilable(f"{where} is a {type(field).__name__}", code="custom_hook")
     if isinstance(descriptor, ForwardManyToOneDescriptor):
         # What ``get_queryset()`` of the descriptor reads a missing object with.
@@ -763,6 +1100,18 @@ def _check_framework_read(model: Any, attribute: str) -> None:
         raise NotCompilable(
             f"{where} is read through {type(manager).__name__}", code="custom_hook"
         )
+
+
+def _registered_read(model: Any, attribute: str, descriptor: Any) -> bool:
+    # The descriptor a registered model field installs on its own name.
+    field = getattr(descriptor, "field", None)
+    registered = _DJANGO_READ_FIELDS.get(type(field))
+    return (
+        registered is not None
+        and type(descriptor) is registered
+        and attribute in (field.name, field.attname)
+        and issubclass(model, field.model)
+    )
 
 
 def _custom(cls: type, name: str) -> bool:
@@ -833,14 +1182,16 @@ def _key_representation(field: Any, name: str) -> Callable[[Any], Any] | None:
     if own is relations.PrimaryKeyRelatedField:
         if pk_field is None:
             return None
-        convert = _FIELD_REPRESENTATIONS.get(
+        target = pk_field
+        registration = _FIELD_REPRESENTATIONS.get(
             definer(type(pk_field), "to_representation")
         )
     else:
-        convert = None if pk_field is not None else _KEY_REPRESENTATIONS.get(own)
-    if convert is None:
+        target = field
+        registration = None if pk_field is not None else _KEY_REPRESENTATIONS.get(own)
+    if registration is None:
         raise NotCompilable(f"{name} is a {type(field).__name__}")
-    return convert
+    return _registered_representation(registration, target, name)
 
 
 def _primary_key(
@@ -860,6 +1211,7 @@ def _primary_key(
             field.field_name, model_field.attname, typing.Any, True, convert=convert
         )
     target = model_field.target_field
+    _check_plain_key(name, target)
     python_type = _BY_INTERNAL_TYPE.get(target.get_internal_type())
     if python_type is None:
         raise NotCompilable(f"{name} points to a {target.get_internal_type()} key")
@@ -1290,7 +1642,13 @@ def _field_signature(field: Any) -> tuple[Any, ...]:
     cls = type(field)
     kind: object
     if isinstance(field, serializers.Serializer):
-        kind = (getattr(getattr(field, "Meta", None), "model", None), signature(field))
+        meta = getattr(field, "Meta", None)
+        kind = (
+            getattr(meta, "model", None),
+            # A nested serializer's own choice (:func:`_delegates`).
+            getattr(meta, "delegate_fields", None),
+            signature(field),
+        )
     elif isinstance(field, serializers.ListSerializer):
         kind = (cls, _field_signature(field.child))
     elif isinstance(field, relations.ManyRelatedField):
@@ -1319,10 +1677,55 @@ def _field_signature(field: Any) -> tuple[Any, ...]:
         definer(cls, "to_representation"),
         definer(cls, "get_attribute"),
         options,
+        _registered_options(field),
     )
 
 
-def compiled_for(serializer: serializers.BaseSerializer) -> "Encoder | None":
+def _registered_options(field: Any) -> tuple[Any, ...]:
+    """The options of a registered field (and of its ``pk_field``)."""
+    values: list[Any] = []
+    for target, registered in (
+        (field, _KEY_REPRESENTATIONS),
+        (field, _FIELD_REPRESENTATIONS),
+        (getattr(field, "pk_field", None), _FIELD_REPRESENTATIONS),
+    ):
+        if target is None:
+            continue
+        registration = registered.get(definer(type(target), "to_representation"))
+        if registration is not None:
+            for option, key in registration.options:
+                value = getattr(target, option, _ABSENT)
+                if key is not None and value is not _ABSENT:
+                    value = key(value)
+                values.append(_comparable(value))
+    return tuple(values)
+
+
+def _comparable(value: Any) -> Any:
+    """
+    ``value`` as part of a signature: containers by their items, other
+    values themselves when hashable, else an object equal to nothing, which
+    compiles a variant per instance.
+    """
+    if isinstance(value, (list, tuple)):
+        return (type(value), tuple(_comparable(item) for item in value))
+    if isinstance(value, (set, frozenset)):
+        return (type(value), frozenset(_comparable(item) for item in value))
+    if isinstance(value, dict):
+        return (
+            dict,
+            tuple((_comparable(k), _comparable(v)) for k, v in value.items()),
+        )
+    try:
+        hash(value)
+    except TypeError:
+        return object()
+    return value
+
+
+def compiled_for(
+    serializer: serializers.BaseSerializer, *, awaits: bool = False
+) -> "Encoder | None":
     """
     Return the compiled encoder for ``serializer`` (or its child), or None
     when the DRF code path should be used.
@@ -1334,6 +1737,9 @@ def compiled_for(serializer: serializers.BaseSerializer) -> "Encoder | None":
     A static serializer (:func:`is_static`) whose representation has a
     coroutine hook returns None without a reason: it is not the compiler's
     to represent, and this may be asked before it is classified.
+
+    ``awaits``: for an asynchronous caller, which awaits the coroutines of
+    delegated fields (:class:`DelegatedStep`); fastdrf's own output never.
     """
     many = isinstance(serializer, serializers.ListSerializer)
     target = serializer.child if many else serializer  # type: ignore[attr-defined]
@@ -1349,8 +1755,9 @@ def compiled_for(serializer: serializers.BaseSerializer) -> "Encoder | None":
         # DRF's BaseSerializer pattern: no fields, only its own methods.
         return _decline(target, backend, f"{type(target).__qualname__} has no fields")  # type: ignore[func-returns-value]  # declining returns None
     parity = fastdrf_settings.SERIALIZER_BACKEND_PARITY
+    delegate = _delegates(target)
     if is_static(target) or fields_from_class(serializer):
-        encoder = _class_encoder(target, backend, parity)
+        encoder = _class_encoder(target, backend, parity, delegate, awaits)
         if encoder is None:
             return None
     elif _custom(type(target), "to_representation"):
@@ -1358,7 +1765,9 @@ def compiled_for(serializer: serializers.BaseSerializer) -> "Encoder | None":
         # built: its signature need not be read.
         encoder = f"{type(target).__qualname__} overrides to_representation()"
     else:
-        encoder = _instance_hook(target) or _variant_encoder(target, backend, parity)
+        encoder = _instance_hook(target) or _variant_encoder(
+            target, backend, parity, delegate, awaits
+        )
     if isinstance(encoder, str):
         return _decline(target, backend, encoder)  # type: ignore[func-returns-value]  # declining returns None
     return encoder
@@ -1388,6 +1797,7 @@ def declines_source(serializer: serializers.BaseSerializer, source: Any) -> bool
                 target,
                 _backend_name(target),
                 f"it represents a {kind.__qualname__}, {what}",
+                code="source_declined",
             )
             return True
     return False
@@ -1420,10 +1830,12 @@ def unreadable_source(serializer: serializers.BaseSerializer, error: Exception) 
 
 
 def _class_encoder(
-    serializer: Any, backend: str, parity: str
+    serializer: Any, backend: str, parity: str, delegate: bool, awaits: bool = False
 ) -> "Encoder | str | None":
     entries = _compiled_by_class.get_or_create(type(serializer))
-    key = (backend, parity)
+    key = (
+        (backend, parity, delegate) if not awaits else (backend, parity, delegate, True)
+    )
     try:
         return entries[key]
     except KeyError:
@@ -1431,15 +1843,17 @@ def _class_encoder(
     # A function of the class too, for a static serializer.
     encoder = (
         None
-        if has_async_representation(serializer)
-        else _compile(serializer, backend, parity)
+        if has_async_representation(serializer) and not (awaits and delegate)
+        else _compile(serializer, backend, parity, delegate, awaits)
     )
     return entries.setdefault(key, encoder)
 
 
-def _variant_encoder(serializer: Any, backend: str, parity: str) -> "Encoder | str":
+def _variant_encoder(
+    serializer: Any, backend: str, parity: str, delegate: bool, awaits: bool = False
+) -> "Encoder | str":
     variants = _compiled.get_or_create(type(serializer))
-    key = (backend, parity, signature(serializer))
+    key = (backend, parity, delegate, awaits, signature(serializer))
     try:
         return variants[key]
     except KeyError:
@@ -1447,16 +1861,18 @@ def _variant_encoder(serializer: Any, backend: str, parity: str) -> "Encoder | s
             return _TOO_MANY_VARIANTS
     # Compiled outside the lock; the bound is enforced inside it, where
     # threads that compiled the same or other variants meet.
-    encoder = _compile(serializer, backend, parity)
+    encoder = _compile(serializer, backend, parity, delegate, awaits)
     with _lock:
         if key not in variants and len(variants) >= MAX_VARIANTS:
             return _TOO_MANY_VARIANTS
         return variants.setdefault(key, encoder)
 
 
-def _compile(serializer: Any, backend: str, parity: str) -> "Encoder | str":
+def _compile(
+    serializer: Any, backend: str, parity: str, delegate: bool, awaits: bool = False
+) -> "Encoder | str":
     try:
-        spec = analyze(serializer, parity)
+        spec = analyze(serializer, parity, delegate, awaits)
         # Building can fail too: a backend may be unable to express what
         # the analysis accepted.
         encoder = _build(backend, spec)
@@ -1466,6 +1882,8 @@ def _compile(serializer: Any, backend: str, parity: str) -> "Encoder | str":
     encoder.columns = _columns(
         getattr(getattr(serializer, "Meta", None), "model", None), spec
     )
+    encoder.delegated = spec.delegation()
+    encoder.backend = backend
     encoder.dump = _in_call(encoder.dump)
     encoder.dump_many = _in_call(encoder.dump_many)
     return encoder
@@ -1521,6 +1939,24 @@ _LOADED_TYPES = frozenset(
 )
 
 
+@depends_on_classification
+@class_cache
+def _plain_meta(cls: type) -> type | None:
+    """
+    ``cls.Meta`` when it is a plain class and instances of ``cls`` keep
+    their attributes in a plain ``__dict__``; else None. Read statically,
+    once per class: ``loaded_encoder`` runs for every output.
+    """
+    meta = inspect.getattr_static(cls, "Meta", None)
+    if (
+        type(meta) is not type
+        or type(inspect.getattr_static(cls, "__dict__", None))
+        is not GetSetDescriptorType
+    ):
+        return None
+    return meta
+
+
 def loaded_encoder(serializer: serializers.BaseSerializer) -> "Encoder | None":
     """
     Return the encoder of a static ``serializer``'s class when it is compiled
@@ -1552,12 +1988,8 @@ def loaded_encoder(serializer: serializers.BaseSerializer) -> "Encoder | None":
         "_kwargs",
     ) or isinstance(serializer, serializers.ListSerializer):
         return None
-    meta = inspect.getattr_static(cls, "Meta", None)
-    if (
-        type(meta) is not type
-        or type(inspect.getattr_static(cls, "__dict__", None))
-        is not GetSetDescriptorType
-    ):
+    meta = _plain_meta(cls)
+    if meta is None:
         return None
     state = vars(serializer)
     if (
@@ -1570,12 +2002,32 @@ def loaded_encoder(serializer: serializers.BaseSerializer) -> "Encoder | None":
     ):
         return None
     source = state["instance"]
-    backend = inspect.getattr_static(meta, "serializer_backend", None)
+    # As ``getattr_static`` reads them: ``Meta`` is a plain class (above),
+    # whose class dictionaries along its MRO are all there is.
+    backend = delegate = None
+    for klass in reversed(meta.__mro__):
+        options = klass.__dict__
+        backend = options.get("serializer_backend", backend)
+        delegate = options.get("delegate_fields", delegate)
     if backend is not None and type(backend) is not str:
         return None
     backend = backend or fastdrf_settings.SERIALIZER_BACKEND
-    encoder = entries.get((backend, fastdrf_settings.SERIALIZER_BACKEND_PARITY))
-    if not isinstance(encoder, Encoder) or encoder.columns is None:
+    if delegate is not None and type(delegate) is not bool:
+        return None
+    encoder = entries.get(
+        (
+            backend,
+            fastdrf_settings.SERIALIZER_BACKEND_PARITY,
+            fastdrf_settings.DELEGATE_FIELDS if delegate is None else delegate,
+        )
+    )
+    if (
+        not isinstance(encoder, Encoder)
+        or encoder.columns is None
+        # Its delegated fields need the serializer's fields; never the case
+        # today, since a delegated field reads no column.
+        or encoder.delegated is not None
+    ):
         return None
     if type(source) is not inspect.getattr_static(meta, "model", None):
         return None
@@ -1604,17 +2056,32 @@ def _list_hook(serializer: Any) -> str | None:
     return None
 
 
+def _called_parts(field: Any) -> Iterator[tuple[Any, str]]:
+    """``field`` and the fields DRF calls to represent its value."""
+    yield field, ""
+    # A to-many relation represents each item with its child relation.
+    child = getattr(field, "child_relation", None)
+    if child is not None:
+        yield child, " (its child_relation)"
+    for owner, label in ((field, ""), (child, " (its child_relation)")):
+        pk_field = getattr(owner, "pk_field", None)
+        if pk_field is not None:
+            yield pk_field, f"{label} (its pk_field)"
+
+
 def _instance_hook(serializer: Any) -> str | None:
     """The reason an instance's own method keeps it on DRF, or None."""
     for name in _INSTANCE_HOOKS:
         if name in vars(serializer):
             return f"{name}() is assigned to the instance"
     for field in serializer._readable_fields:
-        for name in _INSTANCE_HOOKS:
-            if name in vars(field):
-                return (
-                    f"field {field.field_name!r} has {name}() assigned to the instance"
-                )
+        for part, label in _called_parts(field):
+            for name in _INSTANCE_HOOKS:
+                if name in vars(part):
+                    return (
+                        f"field {field.field_name!r}{label} has {name}() "
+                        "assigned to the instance"
+                    )
         # DRF calls the child's methods for every item of a nested list.
         child = field.child if isinstance(field, serializers.ListSerializer) else field
         if isinstance(child, serializers.Serializer):
@@ -1624,11 +2091,14 @@ def _instance_hook(serializer: Any) -> str | None:
     return None
 
 
-def _decline(serializer: Any, backend: str, reason: str) -> None:
+def _decline(
+    serializer: Any, backend: str, reason: str, code: str = "not_compiled"
+) -> None:
     if _fallback(serializer) == "error":
         raise ImproperlyConfigured(
             f"{type(serializer).__qualname__} cannot use the {backend} backend: {reason}."
         )
+    left_to_drf(serializer, backend, code, reason)
 
 
 def _fallback(serializer: Any) -> str:
@@ -1642,8 +2112,14 @@ def _fallback(serializer: Any) -> str:
 def clear_compiled(*, setting: str, **kwargs: Any) -> None:
     # ``analyze`` reads DRF's output formats.
     if setting == "REST_FRAMEWORK":
-        _compiled.clear()
-        _compiled_by_class.clear()
+        forget_compiled()
+
+
+def forget_compiled() -> None:
+    """Compile every serializer again, after a registration."""
+    _compiled.clear()
+    _compiled_by_class.clear()
+    _plain_meta.cache_clear()
 
 
 setting_changed.connect(clear_compiled)
@@ -1662,8 +2138,13 @@ def report_details(
     serializer: serializers.BaseSerializer,
     parity: str = "strict",
     backend: str | None = None,
+    delegate: bool | None = None,
 ) -> Eligibility:
-    """Structured counterpart of :func:`report`; codes do not depend on wording."""
+    """
+    Structured counterpart of :func:`report`; codes do not depend on wording.
+    ``delegate`` defaults to the serializer's ``Meta.delegate_fields``, else
+    ``DELEGATE_FIELDS``.
+    """
     target = serializer
     if isinstance(serializer, serializers.ListSerializer):
         reason = _list_hook(serializer)
@@ -1674,13 +2155,32 @@ def report_details(
         reason = _instance_hook(target)
         if reason:
             return Eligibility("custom_hook", reason)
+    if delegate is None:
+        delegate = _delegates(target)
     try:
-        spec = analyze(target, parity)
+        spec = analyze(target, parity, delegate)
         if backend not in (None, "drf"):
             _build(backend, spec)
     except NotCompilable as exc:
         return Eligibility(exc.code, str(exc))
-    return Eligibility()
+    return Eligibility(delegated=spec.delegated)
+
+
+def _delegates(serializer: Any, default: bool | None = None) -> bool:
+    """
+    ``Meta.delegate_fields`` of ``serializer``, else ``default`` (a nested
+    serializer's parent's), else ``DELEGATE_FIELDS``.
+    """
+    meta = getattr(serializer, "Meta", None)
+    delegate = getattr(meta, "delegate_fields", None)
+    if delegate is None:
+        return fastdrf_settings.DELEGATE_FIELDS if default is None else default
+    if type(delegate) is not bool:
+        raise ImproperlyConfigured(
+            f"{type(serializer).__qualname__}.Meta.delegate_fields must be True, "
+            f"False or None, not {delegate!r}."
+        )
+    return delegate
 
 
 def _backend_name(serializer: Any) -> str:
@@ -1709,7 +2209,15 @@ class Encoder:
     (:func:`unreadable_source`).
     """
 
-    __slots__ = ("columns", "dump", "dump_many", "error", "schema")
+    __slots__ = (
+        "backend",
+        "columns",
+        "delegated",
+        "dump",
+        "dump_many",
+        "error",
+        "schema",
+    )
 
     def __init__(
         self,
@@ -1724,3 +2232,7 @@ class Encoder:
         self.error = error
         # The columns it reads, when it reads nothing else (``_columns``).
         self.columns: tuple[str, ...] | None = None
+        # The backend's name, set when it is compiled.
+        self.backend: str | None = None
+        # The fields the serializer's own fields represent (:func:`fill_delegated`).
+        self.delegated: Delegation | None = None

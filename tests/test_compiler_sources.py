@@ -24,7 +24,7 @@ from django.utils import timezone
 
 from fastdrf import compiler
 from fastdrf import serializers as drf_serializers
-from tests.models import Author, Book, Edition, Tag
+from tests.models import Author, Book, Edition, Review, Tag
 
 
 def _data(serializer):
@@ -32,6 +32,21 @@ def _data(serializer):
 
 
 BACKENDS = ["msgspec", "pydantic", "python"]
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("many", [False, True])
+@pytest.mark.parametrize("value", ["\ud800", "\udfff"])
+def test_unencodable_boolean_input_falls_back_to_drf(backend, many, value):
+    class BooleanOutput(drf_serializers.ModelSerializer):
+        class Meta:
+            model = Edition
+            fields = ["active"]
+            serializer_backend = backend
+
+    instance = Edition(active=value)
+    serializer = BooleanOutput([instance] if many else instance, many=many)
+    assert serializer.data == ([{"active": True}] if many else {"active": True})
 
 
 class TagOut(drf_serializers.ModelSerializer):
@@ -340,6 +355,39 @@ def test_fast_parity_raises_where_the_compiled_class_cannot_read(db, backend):
     ):
         with override_settings(FASTDRF=settings), pytest.raises(error):
             _data(serializer)
+
+
+class ThroughReadOnly(drf_serializers.ModelSerializer):
+    code = drf_serializers.ReadOnlyField(source="edition.code")
+    rating = drf_serializers.ReadOnlyField(source="edition.rating")
+    released = drf_serializers.ReadOnlyField(source="edition.released")
+    format = drf_serializers.ReadOnlyField(source="edition.format")
+
+    class Meta:
+        model = Review
+        fields = ["id", "code", "rating", "released", "format"]
+
+
+@pytest.mark.parametrize("parity", ["strict", "fast"])
+def test_a_read_only_field_through_a_relation_outputs_what_drf_does(db, parity):
+    # Unchanged, the value is rendered by DRF's encoder; in either parity.
+    assert "outputs a UUID unchanged" in compiler.report(ThroughReadOnly(), parity)
+    book = Book.objects.create(title="t", isbn="1", author=Author.objects.create())
+    edition = Edition.objects.create(
+        code=uuid.uuid4(),
+        book=book,
+        published=timezone.now(),
+        released=timezone.now().date(),
+        rating=4.5,
+        price=1,
+        format="hb",
+    )
+    review = Review.objects.create(edition=edition)
+    expected = ThroughReadOnly(review).data
+    for backend in BACKENDS:
+        settings = {"SERIALIZER_BACKEND": backend, "SERIALIZER_BACKEND_PARITY": parity}
+        with override_settings(FASTDRF=settings):
+            assert _data(ThroughReadOnly(review)) == expected
 
 
 # What strict parity reads must be Django's code: DRF may read it again.
