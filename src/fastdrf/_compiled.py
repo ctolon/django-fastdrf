@@ -10,6 +10,7 @@ from fastdrf._classify import (
 )
 from fastdrf._inspection import _PLAIN_KWARGS
 from fastdrf.settings import fastdrf_settings
+from fastdrf.signals import left_to_drf, output_compiled
 from fastdrf.utils import user_defines
 
 #: Set by :mod:`fastdrf.mixins` on a serializer that a generic view built,
@@ -72,6 +73,8 @@ def compiled_data(serializer):
 
 
 def _producer(serializer, encoder, source):
+    from fastdrf.compiler import fill_delegated
+
     if isinstance(serializer, serializers.ListSerializer):
 
         def produce(serializer):
@@ -88,24 +91,40 @@ def _producer(serializer, encoder, source):
                 serializer._data = serializer.to_representation(items)
                 return serializer.data
             try:
-                serializer._data = encoder.dump_many(items, serializer.context)
+                data = encoder.dump_many(items, serializer.context)
             except encoder.error as exc:
-                serializer._data = _unreadable(serializer, exc, items)
+                serializer._data = _unreadable(serializer, encoder, exc, items)
+            else:
+                if encoder.delegated:
+                    fill_delegated(serializer.child, encoder.delegated, items, data)
+                _compiled(serializer, encoder, many=True)
+                serializer._data = data
             return serializer.data
 
     else:
 
         def produce(serializer):
             try:
-                serializer._data = encoder.dump(source, serializer.context)
+                data = encoder.dump(source, serializer.context)
             except encoder.error as exc:
-                serializer._data = _unreadable(serializer, exc, source)
+                serializer._data = _unreadable(serializer, encoder, exc, source)
+            else:
+                if encoder.delegated:
+                    fill_delegated(serializer, encoder.delegated, [source], [data])
+                _compiled(serializer, encoder, many=False)
+                serializer._data = data
             return serializer.data
 
     return produce
 
 
-def _unreadable(serializer, error, source):
+def _compiled(serializer, encoder, many):
+    if output_compiled.receivers:
+        target = serializer.child if many else serializer
+        output_compiled.send_robust(type(target), backend=encoder.backend, many=many)
+
+
+def _unreadable(serializer, encoder, error, source):
     """
     DRF's representation of a source the compiled class failed to read, or
     the backend's ``error`` when that is the result
@@ -117,6 +136,7 @@ def _unreadable(serializer, error, source):
 
     if not unreadable_source(serializer, error):
         raise error
+    left_to_drf(serializer, encoder.backend, "unreadable_source", str(error))
     return serializer.to_representation(source)
 
 

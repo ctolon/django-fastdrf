@@ -103,6 +103,10 @@ evicted ones.
   `REST_FRAMEWORK` changes; compiled encoders and recognizers when
   `REST_FRAMEWORK` changes, since they depend on DRF's formats. Backend and
   parity are part of the encoder key.
+- A registration with `fastdrf.registry` (`register_field`,
+  `register_key_field`, `register_model_field`) clears the compiled encoders.
+  `DELEGATE_FIELDS` and `Meta.delegate_fields` are part of the encoder key.
+  Register from `AppConfig.ready()`.
 - Registering a class with `framework_base` clears every cache whose answers
   depend on which classes are the framework's
   (`fastdrf.utils.depends_on_classification`). Register bases at import
@@ -140,6 +144,27 @@ Some state remains the project's responsibility:
 - A kept JSON encoder is shared between threads; an `encoder_class` must not
   keep state between calls.
 
+## I/O and asynchronous callers
+
+django-fastdrf has no asynchronous API: it serves synchronous DRF, and an
+asynchronous layer (aiodrf) builds on it. What it computes is CPU work, so
+such a layer may call it on its event loop, as long as it knows where the
+project's code or the database can run:
+
+| Without I/O | May run the project's code or query |
+| --- | --- |
+| `compiler.compiled_for()`, `analyze()`, `report_details()`, `inputs.recognize()`, `prefetch.auto_prefetch()` (it builds a queryset, lazily) | Delegated fields (`delegated_steps()`), registered representations and model field descriptors (`fastdrf.registry`) |
+| An encoder's `dump`/`dump_many` of instances that have loaded every column it reads, without delegated or registered fields (`loaded_encoder()`) | Any other `dump`/`dump_many`: Django's descriptors load a deferred column or a missing related object |
+| `JSONRenderer`, `MsgspecJSONRenderer`, `PydanticJSONRenderer` and `ORJSONRenderer` of plain data, the codecs, the signals' sending | A renderer registered with `register_data_renderer()`, `PrefetchListSerializer`'s enrichment, signal receivers |
+
+For fields whose code is a coroutine, `compiler.compiled_for(serializer,
+awaits=True)` compiles the other fields and delegates those
+(`Delegation.awaits`). The caller takes each `compiler.delegated_steps()`
+step: `read()` the attribute, `represent()` it, `write()` the value, and
+awaits what is awaitable in between, as `fill_delegated()` does without
+awaiting. django-fastdrf's own output never asks for `awaits`, so such a
+serializer stays on DRF there.
+
 ## Request lifetimes
 
 DRF's view, request and response refer to one another, and a list serializer
@@ -153,7 +178,7 @@ See [views and responses](views.md#responses-that-release-their-request-objects)
 
 ## Deliberate differences and limits
 
-Fast parity, schema serializers and the msgspec renderer have their own
+Fast parity, schema serializers and the optional JSON renderers have their own
 documented output and validation rules. They are opt-in and are not
 DRF-identical.
 
@@ -164,13 +189,16 @@ With weakly bound list children, `child.parent is list_serializer` is
 `False`, and a child kept after its list is gone raises `ReferenceError` when
 it reads `parent`.
 
-Third-party field classes stay on DRF's path. The compatibility tests cover
-DRF's own classes, not arbitrary field classes.
+Fields of other packages and of the project stay on DRF's path unless they
+are registered ([fields of other packages](extending.md)) or delegated
+([delegated fields](serializers.md#delegated-fields)); a registration is a
+promise the compiler takes as given, which `fastdrf.testing` checks in the
+project's tests. Delegated fields run after the compiled fields read the
+instance.
 
 Async views, async ORM access, streaming responses and concurrent list
 enrichment are not included, since they need an async execution layer.
-`PrefetchListSerializer` provides list enrichment in synchronous form. There
-is no OpenAPI integration for schema serializers.
+`PrefetchListSerializer` provides list enrichment in synchronous form.
 
 ## Provenance
 

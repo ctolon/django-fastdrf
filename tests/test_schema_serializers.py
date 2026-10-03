@@ -7,8 +7,12 @@ libraries share, the caches, the views. Library-specific contracts are in
 import gc
 import importlib
 import sys
+import threading
 import weakref
+from collections import deque
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
+from typing import Annotated
 
 import msgspec
 import pydantic
@@ -16,10 +20,12 @@ import pytest
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.db import connection
+from django.http import QueryDict
 from django.test import override_settings
 from django.test.utils import CaptureQueriesContext
 from django.urls import path
 from rest_framework import generics, viewsets
+from rest_framework import serializers as drf_serializers
 from rest_framework.filters import OrderingFilter
 from rest_framework.permissions import AllowAny
 from rest_framework.settings import api_settings
@@ -30,9 +36,9 @@ from rest_framework.views import APIView
 from fastdrf import serializers, typed
 from fastdrf.list_serializers import SchemaListSerializer as WeakSchemaList
 from fastdrf.msgspec.serializers import MsgspecSerializer
-from fastdrf.pydantic.serializers import PydanticSerializer
+from fastdrf.pydantic.serializers import PydanticBackend, PydanticSerializer
 from fastdrf.typed import SchemaViewMixin, adapt, schema_serializer
-from tests.models import Author, Book, Tag
+from tests.models import Author, Book, Profile, Tag
 
 
 def serializer_class(base, schema, **meta):
@@ -58,6 +64,37 @@ BOOKS = {
     "msgspec": (MsgspecSerializer, MsgspecBook),
     "pydantic": (PydanticSerializer, PydanticBook),
 }
+
+
+@pytest.mark.parametrize("library", ["msgspec", "pydantic"])
+@pytest.mark.parametrize("many", [False, True])
+@pytest.mark.parametrize("decimal_value", [False, True])
+def test_equal_replacements_keep_their_output_type_and_precision(
+    library, many, decimal_value
+):
+    from decimal import Decimal
+    from typing import Any
+
+    annotation = Decimal if decimal_value else Any
+    schema = (
+        pydantic.create_model("Replacement", value=(annotation, ...))
+        if library == "pydantic"
+        else msgspec.defstruct("Replacement", [("value", annotation)])
+    )
+
+    class Replace(adapt(schema)):
+        def validate(self, values):
+            values["value"] = Decimal("1.00") if decimal_value else True
+            return values
+
+    body = {"value": "1.0" if decimal_value else 1}
+    serializer = Replace(data=[body] if many else body, many=many)
+    assert serializer.is_valid(), serializer.errors
+    expected = {"value": "1.00" if decimal_value else True}
+    result = serializer.data
+    assert result == ([expected] if many else expected)
+    if not decimal_value:
+        assert type((result[0] if many else result)["value"]) is bool
 
 
 @pytest.mark.parametrize("library", BOOKS)
@@ -593,6 +630,60 @@ def test_a_class_in_use_survives_the_eviction_of_one_that_is_not():
     assert len(cache) == 3
 
 
+def _finishes(function):
+    # In a thread: a deadlock fails the test instead of hanging it.
+    outcome = []
+    worker = threading.Thread(target=lambda: outcome.append(function()), daemon=True)
+    worker.start()
+    worker.join(timeout=10)
+    assert not worker.is_alive(), "deadlocked"
+    return outcome[0]
+
+
+def test_a_build_may_use_the_cache_for_another_key():
+    cache = typed.BoundedCache(3)
+    outer = _finishes(lambda: cache.get("a", lambda: cache.get("b", lambda: "B") + "A"))
+    assert outer == "BA"
+    assert set(cache) == {"a", "b"}
+
+
+def test_a_schema_hook_building_a_partial_schema_does_not_deadlock():
+    class Peer(pydantic.BaseModel):
+        value: int
+
+    class Hooked(pydantic.BaseModel):
+        value: int
+
+        @classmethod
+        def __pydantic_init_subclass__(cls, **kwargs):
+            super().__pydantic_init_subclass__(**kwargs)
+            PydanticBackend().partial_schema(Peer)
+
+    def validate():
+        serializer = serializer_class(PydanticSerializer, Hooked)(
+            data={"value": 1}, partial=True
+        )
+        return serializer.is_valid()
+
+    assert _finishes(validate)
+
+
+def test_concurrent_first_builds_publish_one_value():
+    cache = typed.BoundedCache(3)
+    start = threading.Barrier(8)
+
+    def build():
+        return object()
+
+    def get():
+        start.wait()
+        return cache.get("a", build)
+
+    with ThreadPoolExecutor(8) as pool:
+        values = list(pool.map(lambda _: get(), range(8)))
+    assert all(value is values[0] for value in values)
+
+
 @pytest.mark.parametrize("size", [0, -1, 1.5, "2"])
 def test_a_cache_size_is_a_positive_integer(size):
     with pytest.raises(ValueError, match="positive integer"):
@@ -990,3 +1081,647 @@ def test_a_msgspec_schema_hook_describes_custom_types():
         Referenced, ref_prefix="#/", direction="request"
     )
     assert body["properties"]["reference"] == {"type": "string"}
+
+
+# -- validate() ----------------------------------------------------------------------
+
+
+def _changed_by_validate(library):
+    import msgspec
+    import pydantic
+
+    from fastdrf.msgspec.serializers import MsgspecSerializer
+    from fastdrf.pydantic.serializers import PydanticSerializer
+
+    class Struct(msgspec.Struct):
+        title: str
+        pages: int = 0
+
+    class Model(pydantic.BaseModel):
+        title: str
+        pages: int = 0
+
+    base, schema = (
+        (MsgspecSerializer, Struct)
+        if library == "msgspec"
+        else (PydanticSerializer, Model)
+    )
+
+    class Upper(base):
+        class Meta:
+            pass
+
+        def validate(self, attrs):
+            return {**attrs, "title": attrs["title"].upper()}
+
+    Upper.Meta.schema = schema
+    return Upper
+
+
+@pytest.mark.parametrize("library", ["msgspec", "pydantic"])
+@pytest.mark.parametrize("partial", [False, True])
+def test_data_after_validation_is_what_validate_returned(library, partial):
+    # DRF represents validated_data: what validate() returned.
+    serializer = _changed_by_validate(library)(
+        data={"title": "hello", "pages": 3}, partial=partial
+    )
+    serializer.is_valid(raise_exception=True)
+    assert serializer.validated_data["title"] == "HELLO"
+    assert serializer.data["title"] == "HELLO"
+
+
+@pytest.mark.parametrize("library", ["msgspec", "pydantic"])
+def test_data_of_unchanged_input_is_the_schema_objects(library):
+    from fastdrf.typed import SchemaSerializer
+
+    class Kept(_changed_by_validate(library)):
+        def validate(self, attrs):
+            return attrs
+
+    serializer = Kept(data={"title": "hello"})
+    serializer.is_valid(raise_exception=True)
+    assert serializer.data == {"title": "hello", "pages": 0}
+    assert isinstance(serializer, SchemaSerializer)
+
+
+POSTED = []
+
+
+class Bang(msgspec.Struct):
+    title: str
+    pages: int = 0
+
+    def __post_init__(self):
+        POSTED.append(self.title)
+        self.title += "!"
+
+
+class BangSerializer(MsgspecSerializer):
+    class Meta:
+        schema = Bang
+
+
+@pytest.mark.parametrize("many", [False, True])
+def test_data_does_not_run_the_schemas_callbacks_again(many):
+    POSTED.clear()
+    data = [{"title": "hello"}] if many else {"title": "hello"}
+    serializer = BangSerializer(data=data, many=many)
+    serializer.is_valid(raise_exception=True)
+    expected = {"title": "hello!", "pages": 0}
+    assert serializer.data == ([expected] if many else expected)
+    assert POSTED == ["hello"]
+
+
+class Whole(pydantic.BaseModel):
+    title: str
+
+    @pydantic.model_serializer
+    def whole(self):
+        return {"title": self.title, "whole": True}
+
+
+@pytest.mark.parametrize("many", [False, True])
+@pytest.mark.parametrize("library", ["msgspec", "pydantic"])
+def test_changed_and_removed_fields_are_represented_alike_for_one_and_many(
+    library, many
+):
+    if library == "msgspec":
+
+        class Changed(MsgspecSerializer):
+            class Meta:
+                schema = Bang
+
+            def validate(self, attrs):
+                return {**attrs, "title": attrs["title"].upper()}
+
+    else:
+
+        class Changed(PydanticSerializer):
+            class Meta:
+                schema = Whole
+
+            def validate(self, attrs):
+                return {**attrs, "title": attrs["title"].upper()}
+
+    POSTED.clear()
+    data = [{"title": "a"}] if many else {"title": "a"}
+    serializer = Changed(data=data, many=many)
+    serializer.is_valid(raise_exception=True)
+    expected = (
+        {"title": "A!", "pages": 0}
+        if library == "msgspec"
+        else {"title": "A", "whole": True}
+    )
+    assert serializer.data == ([expected] if many else expected)
+    assert POSTED == (["a"] if library == "msgspec" else [])
+
+
+@pytest.mark.parametrize("many", [False, True])
+def test_a_field_validate_removed_is_left_out_for_one_and_many(many):
+    class Removing(MsgspecSerializer):
+        class Meta:
+            schema = Bang
+
+        def validate(self, attrs):
+            return {key: value for key, value in attrs.items() if key != "pages"}
+
+    data = [{"title": "a", "pages": 2}] if many else {"title": "a", "pages": 2}
+    serializer = Removing(data=data, many=many)
+    serializer.is_valid(raise_exception=True)
+    assert serializer.data == ([{"title": "a!"}] if many else {"title": "a!"})
+
+
+class TitleIn(pydantic.BaseModel):
+    title: str
+
+
+class TitleOut(pydantic.BaseModel):
+    title: str
+    category: str = "default"
+
+
+class TitleInStruct(msgspec.Struct):
+    title: str
+
+
+class TitleOutStruct(msgspec.Struct):
+    title: str
+    category: str = "default"
+
+
+@pytest.mark.parametrize("many", [False, True])
+@pytest.mark.parametrize("library", ["msgspec", "pydantic"])
+def test_a_field_validate_adds_for_the_output_is_represented(library, many):
+    base, schemas = (
+        (MsgspecSerializer, (TitleInStruct, TitleOutStruct))
+        if library == "msgspec"
+        else (PydanticSerializer, (TitleIn, TitleOut))
+    )
+
+    class Adds(base):
+        class Meta:
+            pass
+
+        def validate(self, attrs):
+            return {**attrs, "category": "custom"}
+
+    Adds.Meta.input_schema, Adds.Meta.output_schema = schemas
+    data = [{"title": "hello"}] if many else {"title": "hello"}
+    serializer = Adds(data=data, many=many)
+    serializer.is_valid(raise_exception=True)
+    expected = {"title": "hello", "category": "custom"}
+    assert serializer.data == ([expected] if many else expected)
+
+
+# A model instance's to-many relation is a manager; the schema reads its
+# items, as DRF's ListSerializer reads ``.all()`` (from a prefetch, if any).
+
+
+class TitleP(pydantic.BaseModel):
+    title: str
+
+
+class AuthorBooksP(pydantic.BaseModel):
+    name: str
+    books: list[TitleP]
+
+
+class TagNameP(pydantic.BaseModel):
+    name: str
+
+
+class BookTagsP(pydantic.BaseModel):
+    title: str
+    tags: list[TagNameP]
+    author: AuthorBooksP
+
+
+class TitleS(msgspec.Struct):
+    title: str
+
+
+class AuthorBooksS(msgspec.Struct):
+    name: str
+    books: list[TitleS]
+
+
+class TagNameS(msgspec.Struct):
+    name: str
+
+
+class BookTagsS(msgspec.Struct):
+    title: str
+    tags: list[TagNameS]
+    author: AuthorBooksS
+
+
+@pytest.mark.parametrize(
+    ("base", "schema"),
+    [(PydanticSerializer, BookTagsP), (MsgspecSerializer, BookTagsS)],
+)
+def test_a_to_many_relation_of_a_model_instance_is_read(db, base, schema):
+    author = Author.objects.create(name="Ada")
+    book = Book.objects.create(title="t", isbn="1", author=author)
+    book.tags.add(Tag.objects.create(name="x"), Tag.objects.create(name="y"))
+    Book.objects.create(title="u", isbn="2", author=author)
+    expected = {
+        "title": "t",
+        "tags": [{"name": "x"}, {"name": "y"}],
+        "author": {"name": "Ada", "books": [{"title": "t"}, {"title": "u"}]},
+    }
+    Serializer = serializer_class(base, schema)
+    queryset = Book.objects.filter(pk=book.pk).select_related("author")
+    queryset = queryset.prefetch_related("tags", "author__books")
+    loaded = list(queryset)
+    with CaptureQueriesContext(connection) as queries:
+        assert Serializer(loaded[0]).data == expected
+        assert Serializer(loaded, many=True).data == [expected]
+    assert len(queries) == 0
+
+
+class NamedAge(pydantic.BaseModel):
+    name: str
+    age: int
+
+
+class NamedAgeStruct(msgspec.Struct):
+    name: str
+    age: int
+
+
+@pytest.mark.parametrize(
+    ("base", "schema"),
+    [(PydanticSerializer, NamedAge), (MsgspecSerializer, NamedAgeStruct)],
+)
+def test_data_after_invalid_input_is_the_given_input_as_in_drf(base, schema):
+    # The browsable API shows it again in its form.
+    data = {"name": "a", "age": "x", "other": 1}
+    serializer = serializer_class(base, schema)(data=data)
+    assert not serializer.is_valid()
+    assert serializer.data == {"name": "a", "age": "x"}
+    listed = serializer_class(base, schema)(data=[1])
+    assert not listed.is_valid()
+    assert listed.data == {}
+
+
+class ProfileArbitrary(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(arbitrary_types_allowed=True)
+
+    name: str
+    profile: Profile
+    books: list[TitleP]
+
+    @pydantic.field_serializer("profile")
+    def _note(self, profile):
+        assert type(profile) is Profile
+        return {"note": profile.note}
+
+
+@pytest.mark.django_db
+def test_a_model_instance_typed_field_gets_the_instance():
+    author = Author.objects.create(name="p")
+    Profile.objects.create(author=author, note="d")
+    Book.objects.create(title="t", isbn="1", author=author)
+    expected = {"name": "p", "profile": {"note": "d"}, "books": [{"title": "t"}]}
+    Serializer = serializer_class(PydanticSerializer, ProfileArbitrary)
+    loaded = Author.objects.prefetch_related("books").get()
+    assert Serializer(loaded).data == expected
+    assert Serializer([loaded], many=True).data == [expected]
+
+
+# -- Nested partial input, form input, nested callbacks --------------------------------
+
+
+class PairP(pydantic.BaseModel):
+    left: int
+    right: int
+
+
+class PairDefaultP(pydantic.BaseModel):
+    left: int
+    right: int = 99
+
+
+class PairS(msgspec.Struct):
+    left: int
+    right: int
+
+
+class PairDefaultS(msgspec.Struct):
+    left: int
+    right: int = 99
+
+
+class PlainPair(drf_serializers.Serializer):
+    left = drf_serializers.IntegerField()
+    right = drf_serializers.IntegerField(default=99)
+
+
+def _parent(child, many=False):
+    return type("Parent", (drf_serializers.Serializer,), {"pair": child(many=many)})
+
+
+@pytest.mark.parametrize("schema", [PairP, PairDefaultP, PairS, PairDefaultS])
+@pytest.mark.parametrize("many", [False, True])
+def test_a_nested_schema_serializer_is_partial_with_its_root(schema, many):
+    given = [{"left": 1}] if many else {"left": 1}
+    reference = _parent(PlainPair, many)(data={"pair": given}, partial=True)
+    assert reference.is_valid(), reference.errors
+    serializer = _parent(adapt(schema), many)(data={"pair": given}, partial=True)
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.validated_data == reference.validated_data
+    # Not partial: required and defaults as the schema says.
+    full = _parent(adapt(schema), many)(data={"pair": given})
+    assert full.is_valid() == (schema in (PairDefaultP, PairDefaultS))
+
+
+class TagsP(pydantic.BaseModel):
+    tags: list[str] | str
+    seq: Sequence[str] = ()
+    queue: deque[str] = deque()
+    name: str = ""
+
+
+class TagsS(msgspec.Struct):
+    tags: list[str] | str
+    name: str = ""
+
+
+@pytest.mark.parametrize(
+    ("schema", "query", "expected"),
+    [
+        (
+            TagsP,
+            "tags=one&tags=two&seq=a&seq=b&queue=c&queue=d&name=n",
+            {
+                "tags": ["one", "two"],
+                "seq": ["a", "b"],
+                "queue": ["c", "d"],
+                "name": "n",
+            },
+        ),
+        (TagsP, "tags=one", {"tags": ["one"]}),
+        (TagsS, "tags=one&tags=two&name=n", {"tags": ["one", "two"], "name": "n"}),
+        (TagsS, "tags=one", {"tags": ["one"]}),
+    ],
+)
+def test_form_input_keeps_every_value_of_a_field_that_takes_a_list(
+    schema, query, expected
+):
+    serializer = adapt(schema)(data=QueryDict(query))
+    assert serializer.is_valid(), serializer.errors
+    data = {
+        key: list(value) if isinstance(value, (tuple, deque)) else value
+        for key, value in serializer.validated_data.items()
+    }
+    assert {key: data[key] for key in expected} == expected
+
+
+class StrictModel(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(strict=True)
+
+    value: int
+    flag: bool = False
+
+
+def test_form_input_is_coerced_for_a_strict_model():
+    serializer = adapt(StrictModel)(data=QueryDict("value=12&flag=true"))
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.validated_data == {"value": 12, "flag": True}
+    # JSON keeps the model's strictness.
+    assert not adapt(StrictModel)(data={"value": "12"}).is_valid()
+
+
+POST_INITS = []
+
+
+class CountedInner(msgspec.Struct):
+    value: int
+
+    def __post_init__(self):
+        POST_INITS.append(1)
+        self.value += 1
+
+
+class CountedOuter(msgspec.Struct):
+    inner: CountedInner
+    items: list[CountedInner] = []
+    by_key: dict[str, CountedInner] = {}
+
+
+def test_a_nested_struct_is_represented_without_its_callbacks():
+    POST_INITS.clear()
+    serializer = adapt(CountedOuter)(
+        data={
+            "inner": {"value": 1},
+            "items": [{"value": 1}],
+            "by_key": {"a": {"value": 1}},
+        }
+    )
+    assert serializer.is_valid()
+    assert len(POST_INITS) == 3
+    expected = {
+        "inner": {"value": 2},
+        "items": [{"value": 2}],
+        "by_key": {"a": {"value": 2}},
+    }
+    assert serializer.data == expected
+    obj = serializer.validated_object
+    assert adapt(CountedOuter)(obj).data == expected
+    assert adapt(CountedOuter)([obj], many=True).data == [expected]
+    assert len(POST_INITS) == 3
+
+
+# -- Nested validated data is represented, partial extras ------------------------------
+
+
+class WireP(pydantic.BaseModel):
+    value: int = pydantic.Field(alias="wire")
+
+
+class WireS(msgspec.Struct, rename={"value": "wire"}):
+    value: int
+
+
+@pytest.mark.parametrize("schema", [WireP, WireS])
+@pytest.mark.parametrize("many", [False, True])
+def test_nested_validated_data_is_represented_as_validated(schema, many):
+    given = [{"wire": 1}, {"wire": 2}] if many else {"wire": 1}
+    serializer = _parent(adapt(schema), many)(data={"pair": given})
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.data == {"pair": given}
+
+
+@pytest.mark.parametrize("schema", [PairP, PairS])
+@pytest.mark.parametrize("many", [False, True])
+def test_nested_partial_data_is_represented_as_given(schema, many):
+    given = [{"left": 1}] if many else {"left": 1}
+    serializer = _parent(adapt(schema), many)(data={"pair": given}, partial=True)
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.data == {"pair": given}
+
+
+class ExtraAllowed(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="allow")
+
+    name: str = "default"
+
+
+@pytest.mark.parametrize("key", ["custom", "model_config", "model_dump"])
+@pytest.mark.parametrize("partial", [False, True])
+def test_an_extra_field_is_its_value_whatever_its_name(key, partial):
+    serializer = adapt(ExtraAllowed)(data={key: "client"}, partial=partial)
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.validated_data[key] == "client"
+    assert serializer.data[key] == "client"
+
+
+# -- Mixed lists, aliased error paths --------------------------------------------------
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("schema", [BookTagsP, BookTagsS])
+def test_a_mixed_list_is_represented_in_any_order(schema):
+    author = Author.objects.create(name="Ada")
+    book = Book.objects.create(title="t", isbn="1", author=author)
+    book.tags.add(Tag.objects.create(name="x"))
+    plain = {"title": "plain", "tags": [], "author": {"name": "n", "books": []}}
+    Serializer = serializer_class(
+        PydanticSerializer if schema is BookTagsP else MsgspecSerializer, schema
+    )
+    one = Serializer(book).data
+    other = Serializer(plain).data
+    assert Serializer([book, plain], many=True).data == [one, other]
+    assert Serializer([plain, book], many=True).data == [other, one]
+    assert Serializer([], many=True).data == []
+
+
+class LocByName(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(loc_by_alias=False)
+
+    value: int = pydantic.Field(alias="wire")
+
+
+class PathAliased(pydantic.BaseModel):
+    value: int = pydantic.Field(validation_alias=pydantic.AliasPath("payload", "value"))
+
+
+class PathParent(pydantic.BaseModel):
+    child: PathAliased
+    children: list[PathAliased] = []
+
+
+@pytest.mark.parametrize(
+    ("schema", "data", "path", "code"),
+    [
+        (LocByName, {"wire": "bad"}, ("wire",), "int_parsing"),
+        (LocByName, {}, ("wire",), "required"),
+        (PathAliased, {}, ("payload",), "required"),
+        (PathParent, {"child": {}}, ("child", "payload"), "required"),
+        (
+            PathParent,
+            {"child": {"payload": {}}},
+            ("child", "payload", "value"),
+            "required",
+        ),
+        (
+            PathParent,
+            {"child": {"payload": {"value": 1}}, "children": [{}]},
+            ("children", 0, "payload"),
+            "required",
+        ),
+        (
+            PathParent,
+            {"child": {"payload": {"value": "x"}}},
+            ("child", "payload", "value"),
+            "int_parsing",
+        ),
+    ],
+)
+def test_an_error_is_keyed_where_the_input_has_it(schema, data, path, code):
+    serializer = adapt(schema)(data=data)
+    assert not serializer.is_valid()
+    node = serializer.errors
+    for segment in path:
+        node = node[segment]
+    assert [error.code for error in node] == [code]
+
+
+# -- Relations behind Annotated, Sequence, exclude=True --------------------------------
+
+
+class TagOnlyP(pydantic.BaseModel):
+    name: str
+
+
+class BookOnlyP(pydantic.BaseModel):
+    title: str
+    tags: list[TagOnlyP]
+
+
+class AuthorPlainP(pydantic.BaseModel):
+    books: list[BookOnlyP]
+
+
+class AuthorAnnotatedP(pydantic.BaseModel):
+    books: list[Annotated[BookOnlyP, pydantic.Field(title="A book")]]
+
+
+class AuthorOptionalAnnotatedP(pydantic.BaseModel):
+    books: list[Annotated[BookOnlyP | None, pydantic.Field(title="A book")]] | None
+
+
+class AuthorSequenceP(pydantic.BaseModel):
+    books: Sequence[BookOnlyP]
+
+
+class BookExcludedP(pydantic.BaseModel):
+    title: str
+    tags: list[TagOnlyP] = pydantic.Field(exclude=True)
+
+
+class TagOnlyS(msgspec.Struct):
+    name: str
+
+
+class BookOnlyS(msgspec.Struct):
+    title: str
+    tags: list[TagOnlyS]
+
+
+class AuthorAnnotatedS(msgspec.Struct):
+    books: list[Annotated[BookOnlyS, msgspec.Meta(title="A book")]]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "schema",
+    [
+        AuthorPlainP,
+        AuthorAnnotatedP,
+        AuthorOptionalAnnotatedP,
+        AuthorSequenceP,
+        AuthorAnnotatedS,
+    ],
+)
+@pytest.mark.parametrize("prefetched", [False, True])
+def test_relations_behind_any_annotation_are_read(schema, prefetched):
+    author = Author.objects.create(name="Ada")
+    book = Book.objects.create(title="book", isbn="1", author=author)
+    book.tags.add(Tag.objects.create(name="tag"))
+    queryset = Author.objects.all()
+    if prefetched:
+        queryset = queryset.prefetch_related("books__tags")
+    loaded = list(queryset)
+    expected = {"books": [{"title": "book", "tags": [{"name": "tag"}]}]}
+    assert adapt(schema)(loaded[0]).data == expected
+    assert adapt(schema)(loaded, many=True).data == [expected]
+
+
+@pytest.mark.django_db
+def test_an_excluded_relation_is_read_and_left_out():
+    book = Book.objects.create(title="book", isbn="1", author=Author.objects.create())
+    book.tags.add(Tag.objects.create(name="tag"))
+    assert adapt(BookExcludedP)(book).data == {"title": "book"}
+    assert adapt(BookExcludedP)([book], many=True).data == [{"title": "book"}]
+    assert list(adapt(BookExcludedP)().fields) == ["title"]

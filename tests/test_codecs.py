@@ -249,3 +249,22 @@ def test_a_given_type_adapter_is_used_as_it_is():
     assert PydanticCodec(adapter).adapter is adapter
     model_codec = PydanticCodec(pydantic.create_model("Model", value=(int, ...)))
     assert model_codec.loads(model_codec.dumps({"value": 1})).value == 1
+
+
+def test_every_small_integer_a_codec_writes_reads_back_as_itself():
+    # MessagePack writes 0 to 127 as one byte, which is also how a Redis
+    # integer's ASCII digits begin: 49 is the byte "1".
+    import enum
+
+    from fastdrf.codecs import MsgspecCodec
+
+    Code = enum.Enum("Code", {f"V{value}": value for value in (*range(128), 128, -1)})
+    typed = MsgspecCodec(Code)
+    for member in Code:
+        assert typed.loads(typed.dumps(member)) is member
+    untyped = MsgspecCodec()
+    for value in (*range(128), 128, -1, True, False):
+        result = untyped.loads(untyped.dumps(value))
+        assert result == value and type(result) is type(value)
+    hooked = MsgspecCodec(int, enc_hook=lambda obj: 49)
+    assert hooked.loads(hooked.dumps(object())) == 49

@@ -32,6 +32,95 @@ from tests.test_inputs import exact
 SECRET = "private-token"
 
 
+@pytest.mark.parametrize("container", ["direct", "list", "dict", "tuple", "union"])
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("missing", [False, True])
+def test_sibling_models_keep_their_own_error_aliases(container, reverse, missing):
+    class Left(pydantic.BaseModel):
+        model_config = pydantic.ConfigDict(loc_by_alias=False)
+        value: int = pydantic.Field(alias="left_value")
+
+    class Right(pydantic.BaseModel):
+        model_config = pydantic.ConfigDict(loc_by_alias=False)
+        value: int = pydantic.Field(alias="right_value")
+
+    def wrap(model):
+        return {
+            "direct": model,
+            "list": list[model],
+            "dict": dict[str, model],
+            "tuple": tuple[model, ...],
+            "union": model | int,
+        }[container]
+
+    fields = {"left": (wrap(Left), ...), "right": (wrap(Right), ...)}
+    if reverse:
+        fields = dict(reversed(list(fields.items())))
+    schema = pydantic.create_model("Pair", **fields)
+    payload = {}
+    for side in fields:
+        value = {} if missing else {f"{side}_value": "bad"}
+        payload[side] = (
+            [value]
+            if container in ("list", "tuple")
+            else {"item": value}
+            if container == "dict"
+            else value
+        )
+    serializer = serializer_for(schema)(data=payload)
+    assert not serializer.is_valid()
+    for side in fields:
+        errors = serializer.errors[side]
+        if container in ("list", "tuple"):
+            errors = errors[0]
+        elif container == "dict":
+            errors = errors["item"]
+        assert f"{side}_value" in errors
+        assert ("right_value" if side == "left" else "left_value") not in errors
+
+
+@pytest.mark.django_db
+def test_cached_properties_are_not_model_write_fields():
+    from functools import cached_property
+
+    class Input(pydantic.BaseModel):
+        name: str
+
+        @cached_property
+        def upper(self):
+            return self.name.upper()
+
+        @pydantic.model_validator(mode="after")
+        def read_cache(self):
+            _ = self.upper
+            return self
+
+    serializer = serializer_class(Input, model=Author)(data={"name": "Ada"})
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.validated_object.upper == "ADA"
+    assert serializer.validated_data == {"name": "Ada"}
+    assert serializer.save().name == "Ada"
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_bulk_output_does_not_revalidate_existing_models(mixed):
+    class Counted(pydantic.BaseModel):
+        model_config = pydantic.ConfigDict(revalidate_instances="always")
+        value: int
+
+        @pydantic.field_validator("value")
+        @classmethod
+        def increment(cls, value):
+            return value + 1
+
+    one = Counted(value=0)
+    rows = [one, {"value": 0}] if mixed else [one, one]
+    serializer = adapt(Counted)
+    assert serializer(one).data == {"value": 1}
+    assert serializer(rows, many=True).data == [{"value": 1}, {"value": 1}]
+    assert one.value == 1
+
+
 def serializer_class(schema, **meta):
     return type(
         "Serializer",
@@ -641,3 +730,225 @@ def test_serializer_for_takes_models_only():
     assert serializer_for(dict) is None
     assert serializer_for(Item(name="a")) is None
     assert issubclass(serializer_for(Item), PydanticSerializer)
+
+
+class WithFactory(pydantic.BaseModel):
+    name: str
+    tags: list[str] = pydantic.Field(default_factory=list, max_length=2)
+
+
+def test_a_partial_update_of_a_model_with_a_default_factory():
+    serializer = adapt(WithFactory)(data={"name": "n"}, partial=True)
+    assert serializer.is_valid(), serializer.errors
+    assert dict(serializer.validated_data) == {"name": "n"}
+    # The factory's constraint stays.
+    serializer = adapt(WithFactory)(data={"tags": ["a", "b", "c"]}, partial=True)
+    assert not serializer.is_valid()
+    assert "tags" in serializer.errors
+
+
+class EmptyKeyUnion(pydantic.BaseModel):
+    values: int | dict[str, int]
+
+
+class EmptyKeyUnionReversed(pydantic.BaseModel):
+    values: dict[str, int] | int
+
+
+class EmptyKeys(pydantic.BaseModel):
+    values: dict[str, int]
+
+
+class EmptyAlias(pydantic.BaseModel):
+    blank: int = pydantic.Field(alias="")
+    other: int
+
+
+def _errors(schema, data, **kwargs):
+    serializer = serializer_for(schema)(data=data, **kwargs)
+    assert not serializer.is_valid()
+    return serializer.errors
+
+
+@pytest.mark.parametrize("schema", [EmptyKeyUnion, EmptyKeyUnionReversed])
+def test_an_empty_key_in_a_union_is_an_error_of_its_own(schema):
+    errors = _errors(schema, {"values": {"": "bad"}})
+    assert list(errors) == ["values"]
+
+
+def test_an_empty_key_keeps_its_place():
+    errors = _errors(EmptyKeys, {"values": {"": "bad", "x": "bad"}})
+    assert set(errors["values"]) == {"", "x"}
+    assert errors["values"][""][0].code == "int_parsing"
+
+
+def test_an_empty_alias_keeps_its_place():
+    errors = _errors(EmptyAlias, {"": "bad", "other": "bad"})
+    assert set(errors) == {"", "other"}
+
+
+def test_an_empty_key_of_a_list_item_keeps_its_place():
+    errors = _errors(EmptyKeys, [{"values": {"": "bad"}}], many=True)
+    # Keyed or padded by index, as DRF's LIST_SERIALIZER_ERRORS_AS_DICT says.
+    assert list(errors[0]["values"]) == [""]
+
+
+class LastItem(pydantic.BaseModel):
+    value: int = pydantic.Field(validation_alias=pydantic.AliasPath("items", -1))
+
+
+class SecondToLast(pydantic.BaseModel):
+    value: int = pydantic.Field(
+        validation_alias=pydantic.AliasPath("outer", "items", -2)
+    )
+
+
+@pytest.mark.parametrize("as_dict", [True, False])
+@pytest.mark.parametrize(
+    ("schema", "data", "path"),
+    [
+        (LastItem, {"items": ["bad"]}, ("items", 0)),
+        (LastItem, {"items": [1, 2, "bad"]}, ("items", 2)),
+        (SecondToLast, {"outer": {"items": ["bad", 1]}}, ("outer", "items", 0)),
+        (SecondToLast, {"outer": {"items": [1, 2, "bad", 3]}}, ("outer", "items", 2)),
+    ],
+)
+def test_a_negative_alias_index_names_the_inputs_item(schema, data, path, as_dict):
+    drf = {**settings.REST_FRAMEWORK, "LIST_SERIALIZER_ERRORS_AS_DICT": as_dict}
+    with override_settings(REST_FRAMEWORK=drf):
+        errors = _errors(schema, data)
+    node = errors
+    for segment in path:
+        node = node[segment]
+    assert [error.code for error in node] == ["int_parsing"]
+
+
+@pytest.mark.parametrize("as_dict", [True, False])
+def test_a_missing_item_counted_from_the_end_is_reported(as_dict):
+    drf = {**settings.REST_FRAMEWORK, "LIST_SERIALIZER_ERRORS_AS_DICT": as_dict}
+    with override_settings(REST_FRAMEWORK=drf):
+        errors = _errors(LastItem, {"items": []})
+    # No item to name: padding has no place for it.
+    assert [error.code for error in errors["items"][-1]] == ["required"]
+
+
+class CrossAliases(pydantic.BaseModel):
+    a: int = pydantic.Field(alias="b")
+    b: int = pydantic.Field(alias="c")
+
+
+class CycleAliases(pydantic.BaseModel):
+    a: int = pydantic.Field(alias="b")
+    b: int = pydantic.Field(alias="a")
+
+
+class SerializedAs(pydantic.BaseModel):
+    a: int = pydantic.Field(alias="b", serialization_alias="out_a")
+    b: int = pydantic.Field(alias="c", serialization_alias="out_b")
+
+
+class CrossAliasesItems(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(extra="allow")
+
+    items: list[CrossAliases]
+
+
+@pytest.mark.parametrize(
+    ("schema", "data", "expected"),
+    [
+        (CrossAliases, {"b": 1, "c": 2}, {"b": 1, "c": 2}),
+        (CrossAliases, {"c": 2}, {"c": 2}),
+        (CrossAliases, {"b": 1}, {"b": 1}),
+        (CycleAliases, {"b": 1, "a": 2}, {"b": 1, "a": 2}),
+        (CycleAliases, {"a": 2}, {"a": 2}),
+        (SerializedAs, {"c": 2}, {"out_b": 2}),
+        (
+            CrossAliasesItems,
+            {"items": [{"b": 1, "c": 2}], "more": 1},
+            {"items": [{"b": 1, "c": 2}], "more": 1},
+        ),
+    ],
+)
+def test_partial_output_keeps_each_value_with_its_field(schema, data, expected):
+    serializer = serializer_for(schema)(data=data, partial=True)
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.data == expected
+    many = serializer_for(schema)(data=[data], many=True, partial=True)
+    assert many.is_valid(), many.errors
+    assert many.data == [expected]
+
+
+class NameIn(pydantic.BaseModel):
+    name: str
+
+
+class NamePatch(pydantic.BaseModel):
+    name: str | None = None
+
+
+FACTORY_CALLS = []
+
+
+def _counted():
+    FACTORY_CALLS.append(1)
+    return 0
+
+
+class Greeting(pydantic.BaseModel):
+    name: str
+    greeting: str = pydantic.Field(default_factory=lambda data: "hello " + data["name"])
+    counted: int = pydantic.Field(default_factory=_counted)
+
+
+@pytest.mark.parametrize(
+    ("data", "expected"), [({"name": "Ada"}, {"name": "Ada"}), ({}, {})]
+)
+def test_partial_output_runs_no_default_of_a_field_not_given(data, expected):
+    meta = type(
+        "Meta",
+        (),
+        {
+            "input_schema": NameIn,
+            "partial_schema": NamePatch,
+            "output_schema": Greeting,
+        },
+    )
+    Serializer = type("Serializer", (PydanticSerializer,), {"Meta": meta})
+    FACTORY_CALLS.clear()
+    serializer = Serializer(data=data, partial=True)
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.data == expected
+    assert FACTORY_CALLS == []
+
+
+class Origin(pydantic.BaseModel):
+    value: int
+    _origin: int = pydantic.PrivateAttr(default=0)
+
+    def model_post_init(self, context):
+        self._origin = self.value
+
+    @pydantic.computed_field
+    @property
+    def origin(self) -> int:
+        return self._origin
+
+
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        (lambda values: list(reversed(values)), [(2, 2), (1, 1)]),
+        (lambda values: values[1:], [(2, 2)]),
+        (lambda values: [values[1], {"value": 5}], [(2, 2), (5, None)]),
+    ],
+)
+def test_a_list_validate_keeps_each_items_own_object(change, expected):
+    child = serializer_for(Origin)
+
+    class Reordered(child.default_list_serializer_class):
+        def validate(self, attrs):
+            return change(attrs)
+
+    serializer = Reordered(child=child(), data=[{"value": 1}, {"value": 2}])
+    assert serializer.is_valid(), serializer.errors
+    assert [(row["value"], row.get("origin")) for row in serializer.data] == expected

@@ -129,11 +129,13 @@ def test_a_serializer_on_drfs_bases_is_reported_as_left_to_drf(app):
             "eligible": False,
             "code": "drf_serializer",
             "reason": f"{prefix} it would be compiled",
+            "delegated": [],
         },
         "input": {
             "eligible": False,
             "code": "drf_serializer",
             "reason": f"{prefix}: TagSerializer.name has a UniqueValidator",
+            "delegated": [],
         },
     }
     lines = inspect(*serializer_args("MethodSerializer"))
@@ -154,7 +156,7 @@ def test_options(app):
 
 def test_json_is_direction_and_backend_specific(app):
     (author,) = records(*serializer_args("AuthorSerializer"), "--backend", "pydantic")
-    eligible = {"eligible": True, "code": "eligible", "reason": None}
+    eligible = {"eligible": True, "code": "eligible", "reason": None, "delegated": []}
     assert author == {
         "serializer": f"{__name__}.AuthorSerializer",
         "inspected": True,
@@ -187,6 +189,7 @@ def test_a_schema_serializer_is_its_schemas(app):
         "eligible": False,
         "code": "schema_serializer",
         "reason": "msgspec validates and represents it",
+        "delegated": [],
     }
     assert record["directions"] == {"output": own, "input": own}
     lines = inspect(*serializer_args("AuthorSchemaSerializer"))
@@ -222,6 +225,7 @@ def test_a_backend_that_is_not_installed_is_reported_per_direction(app):
         "eligible": False,
         "code": "backend_not_installed",
         "reason": "msgspec is not installed",
+        "delegated": [],
     }
     assert author["directions"] == {"output": missing, "input": missing}
     # What stays on DRF for another reason still says so.
@@ -435,3 +439,57 @@ def test_endpoints_are_inspected_by_their_declarations(app):
         in text
     )
     assert "/undeclared/" in text
+
+
+class Delegating(fastdrf_serializers.ModelSerializer):
+    initials = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Author
+        fields = ["id", "name", "initials"]
+        delegate_fields = True
+
+    def get_initials(self, author):
+        return author.name[:1]
+
+
+def test_delegated_fields_are_named(app):
+    lines = inspect(*serializer_args("Delegating"))
+    assert lines[1:3] == [
+        "  output compiled; delegated: initials",
+        "  input  compiled",
+    ]
+    (record,) = records(*serializer_args("Delegating"))
+    assert record["directions"]["output"]["delegated"] == ["initials"]
+    assert record["directions"]["input"]["delegated"] == []
+
+
+def test_registrations_are_listed(app):
+    from fastdrf import registry
+    from fastdrf.testing import isolated_registry
+    from tests.models import HandleDescriptor, HandleField
+
+    with isolated_registry():
+        registry.register_model_field(HandleField, descriptor=HandleDescriptor)
+        lines = inspect("--registrations")
+        (record,) = [
+            entry
+            for entry in json.loads(
+                "\n".join(inspect("--registrations", "--format", "json"))
+            )
+            if entry["target"] == "tests.models.HandleField"
+        ]
+    assert "model_field  tests.models.HandleField" in lines
+    assert record == {
+        "kind": "model_field",
+        "target": "tests.models.HandleField",
+        "options": [],
+    }
+
+
+@pytest.mark.parametrize(
+    "setting", [{"SERIALIZER_BACKEND": "nope"}, {"SERIALIZER_BACKEND_PARITY": "nope"}]
+)
+def test_an_invalid_setting_is_a_command_error(app, setting):
+    with override_settings(FASTDRF=setting), pytest.raises(CommandError, match="nope"):
+        inspect()

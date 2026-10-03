@@ -21,6 +21,33 @@ factory = APIRequestFactory()
 seen = []
 
 
+@pytest.mark.parametrize("has_get", [False, True])
+@pytest.mark.parametrize("head_allowed", [False, True])
+def test_instance_head_handler_keeps_drfs_allow_header(has_get, head_allowed):
+    class Plain(drf_views.APIView):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.head = lambda request: Response(status=204)
+
+        def post(self, request):
+            return Response(status=204)
+
+    if has_get:
+        Plain.get = Plain.post
+    if not head_allowed:
+        Plain.http_method_names = [
+            name for name in Plain.http_method_names if name != "head"
+        ]
+
+    class Optimized(RequestPlanMixin, Plain):
+        pass
+
+    expected = Plain.as_view()(factory.head("/"))
+    actual = Optimized.as_view()(factory.head("/"))
+    assert actual.status_code == expected.status_code
+    assert actual["Allow"] == expected["Allow"]
+
+
 class HTMLRenderer(BaseRenderer):
     """A second renderer, as the browsable API is, without its templates."""
 

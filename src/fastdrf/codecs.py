@@ -34,6 +34,13 @@ class MsgspecCodec:
     def __init__(self, type=Any, *, enc_hook=None, dec_hook=None):
         import msgspec
 
+        from fastdrf.registry import _decoder, _encoder
+
+        if type is not Any:
+            # The types registered with ``register_msgspec_type``: only a
+            # typed codec reads them back as what was written, not their
+            # JSON form.
+            enc_hook, dec_hook = _encoder(enc_hook), _decoder(dec_hook)
         self.encoder = msgspec.msgpack.Encoder(enc_hook=enc_hook)
         self.decoder = msgspec.msgpack.Decoder(type, dec_hook=dec_hook)
 
@@ -43,11 +50,17 @@ class MsgspecCodec:
             # Encoded first: an integer MessagePack cannot hold fails here, as
             # any other value it cannot hold does, not in ``loads``.
             return b"%d" % value
+        if encoded[0] < 0x80:
+            # An integer from 0 to 127 another value encodes as (an enum
+            # member's, an ``enc_hook``'s): MessagePack's one byte would
+            # read back as ASCII digits ("1" for 49).
+            return b"%d" % encoded[0]
         return encoded
 
     def loads(self, value):
-        # Every MessagePack value but a small integer, which ``dumps`` never
-        # writes, starts with a byte of 0x80 or more; a Redis integer is ASCII.
+        # Every MessagePack value but an integer from 0 to 127, which
+        # ``dumps`` never writes, starts with a byte of 0x80 or more; a Redis
+        # integer is ASCII.
         if value[:1] < b"\x80":
             value = self.encoder.encode(int(value))
         return self.decoder.decode(value)

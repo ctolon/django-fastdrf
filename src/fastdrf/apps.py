@@ -20,10 +20,15 @@ class FastDRFConfig(AppConfig):
     verbose_name = "django-fastdrf"
 
     def ready(self):
-        from fastdrf.checks import check_serializer_backends, check_settings
+        from fastdrf.checks import (
+            check_integrations,
+            check_serializer_backends,
+            check_settings,
+        )
 
         checks.register(check_settings, checks.Tags.compatibility)
         checks.register(check_serializer_backends, checks.Tags.urls)
+        checks.register(check_integrations, checks.Tags.compatibility)
         # Only the package being absent is fine; an error inside it is not.
         if find_spec("drf_spectacular") is not None:
             from fastdrf import spectacular  # noqa: F401 -- registers the extension

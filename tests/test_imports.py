@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import textwrap
+from importlib.util import find_spec
 
 import pytest
 
@@ -27,6 +28,17 @@ class IsOwner(BasePermission):
         "fastdrf.renderers",
         "fastdrf.msgspec.renderers",
         "fastdrf.msgspec.parsers",
+        "fastdrf.pydantic.renderers",
+        "fastdrf.pydantic.parsers",
+        *(
+            pytest.param(
+                name,
+                marks=pytest.mark.skipif(
+                    find_spec("orjson") is None, reason="needs orjson"
+                ),
+            )
+            for name in ("fastdrf.orjson.renderers", "fastdrf.orjson.parsers")
+        ),
         "fastdrf.utils",
     ],
 )

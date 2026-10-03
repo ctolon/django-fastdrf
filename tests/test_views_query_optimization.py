@@ -11,7 +11,8 @@ from django.core.exceptions import FieldError, ImproperlyConfigured
 from django.db import models
 from django.db.models import Prefetch
 from django.test import override_settings
-from rest_framework import generics
+from rest_framework import generics, viewsets
+from rest_framework import serializers as drf_serializers
 from rest_framework.request import Request
 from rest_framework.test import APIRequestFactory
 
@@ -172,3 +173,70 @@ def test_a_fetch_mode_without_django_support_is_reported(monkeypatch, mode):
             view.get_queryset()
     # Without the setting, nothing is asked of Django.
     view.get_queryset()
+
+
+# -- The project's hooks, where DRF runs them -------------------------------------------
+
+
+class _AuthorOut(drf_serializers.ModelSerializer):
+    class Meta:
+        model = Author
+        fields = ["id", "name"]
+
+
+class _BookOut(drf_serializers.ModelSerializer):
+    author = _AuthorOut()
+
+    class Meta:
+        model = Book
+        fields = ["id", "author"]
+        auto_prefetch = True
+
+
+def _view(base, **attrs):
+    return type(
+        "View",
+        (*base, viewsets.ModelViewSet),
+        {
+            "queryset": Book.objects.all(),
+            "authentication_classes": [],
+            "permission_classes": [],
+            **attrs,
+        },
+    )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "base", [(), (QueryOptimizationMixin,)], ids=["drf", "fastdrf"]
+)
+def test_a_serializer_class_per_action_without_destroy(base):
+    def get_serializer_class(self):
+        return {"list": _BookOut, "retrieve": _BookOut}[self.action]
+
+    book = Book.objects.create(
+        title="t", isbn="1", author=Author.objects.create(name="a")
+    )
+    view = _view(base, get_serializer_class=get_serializer_class)
+    response = view.as_view({"delete": "destroy"})(
+        APIRequestFactory().delete("/"), pk=book.pk
+    )
+    assert response.status_code == 204
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "base", [(), (QueryOptimizationMixin,)], ids=["drf", "fastdrf"]
+)
+def test_a_serializer_context_reading_the_queryset(base):
+    def get_serializer_context(self):
+        context = viewsets.ModelViewSet.get_serializer_context(self)
+        context["count"] = self.get_queryset().count()
+        return context
+
+    Book.objects.create(title="t", isbn="1", author=Author.objects.create(name="a"))
+    view = _view(
+        base, serializer_class=_BookOut, get_serializer_context=get_serializer_context
+    )
+    response = view.as_view({"get": "list"})(APIRequestFactory().get("/"))
+    assert response.status_code == 200

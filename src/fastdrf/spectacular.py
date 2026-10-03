@@ -10,6 +10,7 @@ nested classes.
 """
 
 import re
+from collections.abc import Callable
 from typing import Any
 
 from drf_spectacular.drainage import warn
@@ -107,11 +108,26 @@ class SchemaSerializerExtension(OpenApiSerializerExtension):
         body, components = self._shape(direction)
         if direction == "request":
             _, response_components = self._shape("response")
+            differ = {
+                name
+                for name, component in components.items()
+                if response_components.get(name, component) != component
+            }
+            # A component that refers to one renamed is another shape too,
+            # though its own text is the same: so are those that refer to it.
+            uses = {
+                name: _references(component) for name, component in components.items()
+            }
+            changed = True
+            while changed:
+                changed = False
+                for name in components.keys() - differ:
+                    if name in response_components and uses[name] & differ:
+                        differ.add(name)
+                        changed = True
             renames = {}
             taken = {*components, *response_components}
-            for name, component in components.items():
-                if response_components.get(name, component) == component:
-                    continue
+            for name in sorted(differ, key=list(components).index):
                 # ``<Name>Request`` may be a component of its own already.
                 renamed, number = f"{name}Request", 2
                 while renamed in taken:
@@ -195,22 +211,74 @@ def _renamed(
     components: dict[str, dict[str, Any]],
     renames: dict[str, str],
 ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
-    """``body`` and ``components`` with the components in ``renames`` renamed, ``$ref``s included."""
+    """
+    ``body`` and ``components`` with the components in ``renames`` renamed,
+    in their references: ``$ref`` and a discriminator's ``mapping``.
+    """
     references = {COMPONENTS + old: COMPONENTS + new for old, new in renames.items()}
 
-    def walk(node: Any) -> Any:
-        if isinstance(node, dict):
-            return {
-                key: (references.get(value, value) if key == "$ref" else walk(value))
-                for key, value in node.items()
-            }
-        if isinstance(node, list):
-            return [walk(item) for item in node]
-        return node
+    def rename(reference: Any) -> Any:
+        return (
+            references.get(reference, reference)
+            if isinstance(reference, str)
+            else reference
+        )
 
-    return walk(body), {
-        renames.get(name, name): walk(c) for name, c in components.items()
+    return _schema_walk(body, rename), {
+        renames.get(name, name): _schema_walk(component, rename)
+        for name, component in components.items()
     }
+
+
+def _references(schema: dict[str, Any]) -> set[str]:
+    """The names of the components ``schema`` refers to."""
+    found: set[str] = set()
+
+    def note(reference: Any) -> Any:
+        if isinstance(reference, str) and reference.startswith(COMPONENTS):
+            found.add(reference[len(COMPONENTS) :])
+        return reference
+
+    _schema_walk(schema, note)
+    return found
+
+
+def _schema_walk(node: Any, reference: Callable[[Any], Any]) -> Any:
+    """
+    A copy of the schema ``node`` with ``reference`` applied to every
+    reference: a ``$ref`` of a schema and a discriminator's ``mapping``
+    values. The names in ``properties`` are field names (a field may be
+    called ``$ref``) and data (``default``, ``example``) is left as it is.
+    """
+    if isinstance(node, list):
+        return [_schema_walk(item, reference) for item in node]
+    if not isinstance(node, dict):
+        return node
+    walked = {}
+    for key, value in node.items():
+        if key == "$ref":
+            walked[key] = reference(value)
+        elif key in _DATA:
+            walked[key] = value
+        elif key in _SCHEMA_MAPS and isinstance(value, dict):
+            walked[key] = {
+                name: _schema_walk(item, reference) for name, item in value.items()
+            }
+        elif key == "discriminator" and isinstance(value, dict):
+            mapping = value.get("mapping")
+            walked[key] = (
+                {
+                    **value,
+                    "mapping": {
+                        tag: reference(target) for tag, target in mapping.items()
+                    },
+                }
+                if isinstance(mapping, dict)
+                else value
+            )
+        else:
+            walked[key] = _schema_walk(value, reference)
+    return walked
 
 
 def _for_openapi_version(schema: dict[str, Any]) -> dict[str, Any]:
@@ -272,12 +340,36 @@ def _typed_enums(node: Any, *, null_type: bool) -> Any:
     return node
 
 
+# Null as JSON Schema writes it, and as OpenAPI 3.0 does once converted.
+_NULLS = ({"type": "null"}, {"nullable": True, "not": {}})
+# JSON Schema keywords a schema library writes that OpenAPI 3.0's Schema
+# Object does not have (those it converts are handled above).
+_NOT_IN_OPENAPI_30 = frozenset(
+    {
+        "propertyNames",
+        "patternProperties",
+        "dependentRequired",
+        "dependentSchemas",
+        "contains",
+        "minContains",
+        "maxContains",
+        "if",
+        "then",
+        "else",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+        "contentEncoding",
+        "contentMediaType",
+    }
+)
+
 # Keywords whose value maps names to schemas, and whose value is data.
 _SCHEMA_MAPS = ("properties", "patternProperties", "$defs", "definitions")
 _DATA = ("const", "default", "enum", "example", "examples")
 
 
 def _openapi_30(node: Any) -> Any:
+    """``node``, a JSON Schema, and the schemas it holds, in OpenAPI 3.0's dialect."""
     if isinstance(node, list):
         return [_openapi_30(item) for item in node]
     if not isinstance(node, dict):
@@ -292,11 +384,55 @@ def _openapi_30(node: Any) -> Any:
         )
         for key, value in node.items()
     }
+    for step in _OPENAPI_30_STEPS:
+        step(node)
+    return node
+
+
+def _one_example(node: dict[str, Any]) -> None:
+    # OpenAPI 3.0's schema has one ``example``, not JSON Schema's list.
+    examples = node.get("examples")
+    if isinstance(examples, list):
+        del node["examples"]
+        if examples:
+            node.setdefault("example", examples[0])
+
+
+def _no_empty_required(node: dict[str, Any]) -> None:
+    # JSON Schema allows an empty list; OpenAPI 3.0 does not.
+    if node.get("required") == []:
+        del node["required"]
+
+
+def _nullable_type(node: dict[str, Any]) -> None:
+    kind = node.get("type")
+    if kind == "null":
+        # OpenAPI 3.0 has no null type: nothing (``not: {}``), to which
+        # ``nullable`` adds null. Not an enum of null, whose null
+        # drf-spectacular's enum components leave out.
+        del node["type"]
+        node["nullable"] = True
+        node["not"] = {}
+    elif isinstance(kind, list) and "null" in kind:
+        others = [item for item in kind if item != "null"]
+        node["nullable"] = True
+        if len(others) == 1:
+            node["type"] = others[0]
+        elif others:
+            del node["type"]
+            node["anyOf"] = [{"type": item} for item in others]
+        else:
+            del node["type"]
+            node["not"] = {}
+
+
+def _nullable_union(node: dict[str, Any]) -> None:
+    # ``anyOf: [X, {"type": "null"}]``: X, nullable.
     for key in ("anyOf", "oneOf"):
         options = node.get(key)
-        if not options or {"type": "null"} not in options:
+        if not options or not any(option in _NULLS for option in options):
             continue
-        rest = [option for option in options if option != {"type": "null"}]
+        rest = [option for option in options if option not in _NULLS]
         del node[key]
         if len(rest) == 1 and "$ref" not in rest[0]:
             node.update(rest[0])
@@ -305,6 +441,10 @@ def _openapi_30(node: Any) -> Any:
         else:
             node[key] = rest
         node["nullable"] = True
+
+
+def _boolean_exclusive_bounds(node: dict[str, Any]) -> None:
+    # OpenAPI 3.0's exclusive bounds are booleans next to the bound.
     for exclusive, inclusive in (
         ("exclusiveMinimum", "minimum"),
         ("exclusiveMaximum", "maximum"),
@@ -319,8 +459,14 @@ def _openapi_30(node: Any) -> Any:
         )
         node[inclusive] = bound if stricter else other
         node[exclusive] = stricter
+
+
+def _const_as_enum(node: dict[str, Any]) -> None:
     if "const" in node:
         node["enum"] = [node.pop("const")]
+
+
+def _tuple_items(node: dict[str, Any]) -> None:
     if "prefixItems" in node:
         items = node.pop("prefixItems")
         warn(
@@ -331,4 +477,27 @@ def _openapi_30(node: Any) -> Any:
             item for index, item in enumerate(items) if item not in items[:index]
         ]
         node["items"] = distinct[0] if len(distinct) == 1 else {"anyOf": distinct}
-    return node
+
+
+def _no_unsupported_keywords(node: dict[str, Any]) -> None:
+    unsupported = sorted(_NOT_IN_OPENAPI_30.intersection(node))
+    if unsupported:
+        for keyword in unsupported:
+            del node[keyword]
+        warn(
+            f"OpenAPI 3.0 has no {', '.join(unsupported)}: the constraint is left "
+            "out of the document. Set OAS_VERSION to 3.1.0."
+        )
+
+
+# In order: a null type becomes ``nullable`` before null union members are.
+_OPENAPI_30_STEPS = (
+    _one_example,
+    _no_empty_required,
+    _nullable_type,
+    _nullable_union,
+    _boolean_exclusive_bounds,
+    _const_as_enum,
+    _tuple_items,
+    _no_unsupported_keywords,
+)

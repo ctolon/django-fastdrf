@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "django-fastdrf"
-version = "0.3.0"
+version = "0.4.0"
 description = "Opt-in serializer and query optimizations for synchronous Django REST framework."
 readme = "README.md"
 license = "BSD-3-Clause"
@@ -43,10 +43,14 @@ Source = "https://github.com/ctolon/django-fastdrf"
 [project.optional-dependencies]
 msgspec = ["msgspec>=0.19"]
 pydantic = ["pydantic>=2.9"]
+orjson = ["orjson>=3.11"]
 spectacular = ["drf-spectacular>=0.28"]
+countries = ["django-countries>=7.6"]
+money = ["django-money>=3.5"]
+phonenumber = ["django-phonenumber-field[phonenumberslite]>=8.0"]
 
 [dependency-groups]
-dev = ["pytest>=8", "pytest-django>=4.9", "hypothesis>=6", "pytest-cov>=6", "ruff>=0.13", "msgspec>=0.19", "pydantic>=2.9", "django-filter>=25.1", "drf-spectacular>=0.28", "build>=1.2", "nox>=2024.10"]
+dev = ["pytest>=8", "pytest-django>=4.9", "hypothesis>=6", "pytest-cov>=6", "ruff>=0.13", "msgspec>=0.19", "pydantic>=2.9", "orjson>=3.11", "django-filter>=25.1", "drf-spectacular>=0.28", "django-countries>=7.6", "django-money>=3.5", "django-phonenumber-field[phonenumberslite]>=8.0", "build>=1.2", "nox>=2024.10"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fastdrf"]

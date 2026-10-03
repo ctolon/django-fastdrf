@@ -138,3 +138,40 @@ def test_cloned_fields_preserve_request_language(languages):
                 assert not actual.is_valid()
                 assert not expected.is_valid()
                 assert actual.errors == expected.errors
+
+
+@pytest.mark.parametrize("mode", ["deepcopy", "clone", "compiled"])
+@pytest.mark.parametrize(
+    ("attribute", "value", "data"),
+    [
+        ("trim_whitespace", False, {"title": " hello "}),
+        ("allow_blank", True, {"title": ""}),
+        ("max_length", 2, {"title": "hello"}),
+    ],
+)
+def test_state_changed_after_construction_is_copied_as_drf_copies_it(
+    mode, attribute, value, data
+):
+    # DRF builds each copy again from the field's arguments: what was set on
+    # the declared field afterwards is not in the copies.
+    from django.test import override_settings
+    from rest_framework import serializers as drf
+
+    from fastdrf import serializers as fastdrf_serializers
+
+    class Changed(fastdrf_serializers.Serializer):
+        title = drf.CharField()
+
+    setattr(Changed._declared_fields["title"], attribute, value)
+
+    def outcome():
+        serializer = Changed(data=data)
+        valid = serializer.is_valid()
+        return valid, dict(serializer.validated_data) if valid else serializer.errors
+
+    reference = outcome()
+    with override_settings(
+        FASTDRF={"CACHE_SERIALIZER_FIELDS": True, "FIELD_COPY_MODE": mode}
+    ):
+        assert outcome() == reference
+        assert outcome() == reference

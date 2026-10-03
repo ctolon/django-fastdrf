@@ -24,6 +24,27 @@ from tests.test_inputs import exact
 SECRET = "private-token"
 
 
+@pytest.mark.django_db
+@pytest.mark.parametrize("partial", [False, True])
+@pytest.mark.parametrize("update", [False, True])
+def test_unset_fields_are_not_written_to_the_model(partial, update):
+    class OptionalName(msgspec.Struct):
+        name: str | msgspec.UnsetType = msgspec.UNSET
+
+    serializer = serializer_class(OptionalName, model=Author)
+    instance = Author.objects.create(name="Ada") if update else None
+    loaded = serializer(instance, data={}, partial=partial)
+    assert loaded.is_valid(), loaded.errors
+    assert loaded.validated_data == {}
+    saved = loaded.save()
+    saved.refresh_from_db()
+    assert saved.name == ("Ada" if update else "")
+
+    given = serializer(saved, data={"name": "Grace"}, partial=partial)
+    assert given.is_valid(), given.errors
+    assert given.save().name == "Grace"
+
+
 def serializer_class(schema, **meta):
     return type(
         "Serializer",
@@ -569,3 +590,26 @@ def test_serializer_for_takes_structs_only():
     assert serializer_for(dict) is None
     assert serializer_for(Plain(value=1)) is None
     assert issubclass(serializer_for(Plain), MsgspecSerializer)
+
+
+def _renamed(name):
+    return msgspec.defstruct("Wire", [("value", int)], rename={"value": name})
+
+
+@pytest.mark.parametrize("name", ["first.last", "value[0]", "value`end", "a b"])
+@pytest.mark.parametrize("given", [True, False])
+def test_an_error_is_keyed_by_the_wire_name_as_given(name, given):
+    serializer = serializer_for(_renamed(name))(data={name: "bad"} if given else {})
+    assert not serializer.is_valid()
+    assert list(serializer.errors) == [name]
+    (error,) = serializer.errors[name]
+    assert error.code == ("invalid" if given else "required")
+    assert "- at" not in str(error)
+
+
+def test_a_nested_wire_name_with_a_dot_keeps_its_place():
+    Item = msgspec.defstruct("Item", [("value", int)], rename={"value": "x.y"})
+    Holder = msgspec.defstruct("Holder", [("items", list[Item])])
+    serializer = serializer_for(Holder)(data={"items": [{"x.y": 1}, {"x.y": "b"}]})
+    assert not serializer.is_valid()
+    assert list(serializer.errors["items"][1]) == ["x.y"]

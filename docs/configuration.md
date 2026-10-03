@@ -5,7 +5,10 @@
 ```console
 pip install django-fastdrf
 pip install "django-fastdrf[msgspec]"    # for the msgspec backend, renderer, parser and codec
-pip install "django-fastdrf[pydantic]"   # for the pydantic backend, schema serializers and codec
+pip install "django-fastdrf[pydantic]"   # backend, schema serializers, JSON parser/renderer and codec
+pip install "django-fastdrf[orjson]"     # JSON parser/renderer only, not a serializer backend
+pip install "django-fastdrf[spectacular]"  # for OpenAPI of schema serializers
+pip install "django-fastdrf[countries]"    # fastdrf.contrib.countries; also money, phonenumber
 ```
 
 django-fastdrf depends on Django and Django REST framework only. Install an
@@ -23,7 +26,7 @@ need neither. Adding the app to `INSTALLED_APPS` is optional; see
 
 These are the combinations the test suite runs in CI. It also runs on
 free-threaded Python 3.14t, and at the declared minimum versions (Django 5.2,
-DRF 3.16, msgspec 0.19, pydantic 2.9). `FETCH_MODE` needs Django 6.1.
+DRF 3.16, msgspec 0.19, pydantic 2.9, orjson 3.11). `FETCH_MODE` needs Django 6.1.
 
 ## The `FASTDRF` setting
 
@@ -35,6 +38,7 @@ FASTDRF = {
     "SERIALIZER_BACKEND": "drf",
     "SERIALIZER_BACKEND_PARITY": "strict",
     "SERIALIZER_BACKEND_FALLBACK": "drf",
+    "DELEGATE_FIELDS": False,
     "CACHE_SERIALIZER_FIELDS": False,
     "FIELD_COPY_MODE": "deepcopy",
     "BATCH_RELATED_LOOKUPS": False,
@@ -48,6 +52,7 @@ FASTDRF = {
 | `SERIALIZER_BACKEND` | `"drf"` | `"drf"`, `"msgspec"`, `"pydantic"`, `"python"` | What produces the output of fastdrf's serializer bases, and recognizes their input. See [output backends](serializers.md#output-backends). |
 | `SERIALIZER_BACKEND_PARITY` | `"strict"` | `"strict"`, `"fast"` | `strict` compiles only what equals DRF's output; `fast` also accepts documented differences. See [parity](serializers.md#parity). |
 | `SERIALIZER_BACKEND_FALLBACK` | `"drf"` | `"drf"`, `"error"` | What happens to a serializer the backend cannot compile: DRF represents it, or an exception is raised. See [fallback](serializers.md#fallback). |
+| `DELEGATE_FIELDS` | `False` | `True`, `False` | Represent the fields the backend cannot compile with their own code, in the compiled output, instead of leaving the serializer to DRF. See [delegated fields](serializers.md#delegated-fields). |
 | `CACHE_SERIALIZER_FIELDS` | `False` | `True`, `False` | Build a serializer class's fields once and copy them per instance. See [field caching](serializers.md#field-caching-and-copying). |
 | `FIELD_COPY_MODE` | `"deepcopy"` | `"deepcopy"`, `"clone"`, `"compiled"` | How cached fields are copied. Applies only when fields are cached. |
 | `BATCH_RELATED_LOOKUPS` | `False` | `True`, `False` | Look up the items of `PrimaryKeyRelatedField(many=True)` input in one query. See [batched lookups](queries.md#batched-primary-key-lookups). |
@@ -78,6 +83,7 @@ These go in a fastdrf serializer's `Meta`:
 | --- | --- | --- |
 | `serializer_backend` | as `SERIALIZER_BACKEND` | Overrides the project backend for this serializer. |
 | `serializer_backend_fallback` | as `SERIALIZER_BACKEND_FALLBACK` | Overrides the project fallback for this serializer. |
+| `delegate_fields` | `True`, `False`, `None` | Overrides `DELEGATE_FIELDS`. `None` inherits. |
 | `cache_fields` | `True`, `False`, `None` | Overrides `CACHE_SERIALIZER_FIELDS`. `None` inherits. |
 | `field_copy_mode` | as `FIELD_COPY_MODE`, or `None` | Overrides `FIELD_COPY_MODE`. `None` inherits. |
 | `auto_prefetch` | `True`, `False` | Lets `QueryOptimizationMixin` derive related lookups from the fields. |
@@ -113,9 +119,15 @@ INSTALLED_APPS = [
 ```
 
 The app (`fastdrf.apps.FastDRFConfig`) defines no models. It registers the
-[system checks](#system-checks) and makes the
-[management commands](commands.md) available. Every other feature works
+[system checks](#system-checks), makes the
+[management commands](commands.md) available and, with drf-spectacular,
+loads the OpenAPI extension for schema serializers. Every other feature works
 without it.
+
+The applications of `fastdrf.contrib` (`fastdrf.contrib.phonenumber`,
+`fastdrf.contrib.countries`, `fastdrf.contrib.money`) register the fields of
+those packages with the compiler; add the ones whose package the project
+uses ([fields of other packages](extending.md)).
 
 ## System checks
 
@@ -130,8 +142,9 @@ system checks (`runserver`, `migrate`, Django's test runner), reports:
 | `fastdrf.E004` | `SERIALIZER_BACKEND` is `msgspec` or `pydantic` and that package is not installed. |
 | `fastdrf.E005` | A `SchemaViewMixin` view in the URLconf uses a serializer that `ALLOWED_SERIALIZER_BACKENDS` does not allow. Every such view is listed. |
 | `fastdrf.E006` | `FETCH_MODE` is set and Django has no `QuerySet.fetch_mode()` (before 6.1). |
+| `fastdrf.I001` | `SERIALIZER_BACKEND` (not a serializer's `Meta.serializer_backend`) compiles, and django-phonenumber-field, django-countries or django-money can be imported without its `fastdrf.contrib` application installed ([fields of other packages](extending.md)). |
 
-All are errors. Without the app none of them runs and the same mistakes
+All but `fastdrf.I001`, a hint, are errors. Without the app none of them runs and the same mistakes
 surface later: an invalid `FASTDRF` raises `ImproperlyConfigured` when a
 value is first read, a missing backend package raises `ImportError` when a
 serializer first uses it, a disallowed serializer raises in the view's

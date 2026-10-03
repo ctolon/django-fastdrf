@@ -17,11 +17,14 @@ msgspec and pydantic are imported only to read a class of that library;
 writing their source needs neither.
 """
 
+import builtins
+import copy
 import datetime
 import decimal
 import enum
 import keyword
 import math
+import re
 import types
 import typing
 import uuid
@@ -88,13 +91,41 @@ class Schema:
     notes: list[str] = field(default_factory=list)
 
 
+# The names a generated module refers to besides its classes: builtins,
+# its imports and the typing names it uses.
+_GENERATED_REFERENCES = frozenset(
+    {
+        *dir(builtins),
+        "Annotated",
+        "Any",
+        "BaseModel",
+        "ConfigDict",
+        "Field",
+        "Literal",
+        "datetime",
+        "decimal",
+        "msgspec",
+        "serializers",
+        "uuid",
+    }
+)
+
+
 class _Names:
     """Unique class names, in the order the classes must be emitted."""
 
     def __init__(self) -> None:
         self.schemas: list[Schema] = []
-        self.taken: set[str] = set()
+        # A class must not shadow what the generated module refers to.
+        self.taken: set[str] = set(_GENERATED_REFERENCES)
         self.by_key: dict[Any, Schema] = {}
+        # DRF serializers being read, by structure: a recursive one meets
+        # itself (a cycle).
+        self.reading: dict[Any, Schema] = {}
+        self.recursive: set[int] = set()
+        # Finished DRF serializers' classes, by serializer class and
+        # direction: one class per contract (fields, types, constraints).
+        self.read: dict[Any, list[Schema]] = {}
 
     def new(self, key: Any, name: str) -> Schema:
         unique, number = name, 2
@@ -108,10 +139,13 @@ class _Names:
     def done(self, schema: Schema) -> None:
         self.schemas.append(schema)
 
+    def release(self, schema: Schema) -> None:
+        """Give up a class read again: its name is free."""
+        self.taken.discard(schema.name)
+
 
 # -- Reading a DRF serializer ------------------------------------------------
 
-_SLUG_PATTERN = r"^[-a-zA-Z0-9_]+$"
 # Collected into one note per class.
 _TRIMS = "trims whitespace"
 
@@ -139,6 +173,8 @@ def _base_name(class_name: str) -> str:
 
 def _splits(serializer: Any, seen: set[int] | None = None) -> bool:
     """Whether it or a nested serializer has read-only or write-only fields."""
+    from rest_framework.fields import DictField, ListField
+
     seen = set() if seen is None else seen
     if id(serializer) in seen:
         return False
@@ -146,6 +182,8 @@ def _splits(serializer: Any, seen: set[int] | None = None) -> bool:
     for drf_field in serializer.fields.values():
         if drf_field.read_only or drf_field.write_only:
             return True
+        while isinstance(drf_field, ListField | DictField):
+            drf_field = drf_field.child
         nested = _nested(drf_field)
         if nested is not None and _splits(nested, seen):
             return True
@@ -165,16 +203,57 @@ def _nested(drf_field: Any) -> Any:
 def _read_serializer(
     serializer: Any, direction: str, names: _Names, name: str
 ) -> Schema:
-    # One class per serializer class, unless an instance changed its fields.
+    # One class per contract: instances of one serializer class whose fields
+    # differ in an option (a max_length) get classes of their own. A
+    # serializer that nests itself meets its own reading: the cycle.
     key = (
         type(serializer),
         direction,
         tuple((key, type(value)) for key, value in serializer.fields.items()),
     )
-    if key in names.by_key:
-        return names.by_key[key]
+    if key in names.reading:
+        names.recursive.add(id(names.reading[key]))
+        return names.reading[key]
     schema = names.new(key, name)
-    from rest_framework.fields import HiddenField
+    names.reading[key] = schema
+    try:
+        _read_fields(serializer, direction, names, schema)
+    finally:
+        del names.reading[key]
+    same = (type(serializer), direction)
+    if id(schema) not in names.recursive:
+        for other in names.read.get(same, ()):
+            if _contract(other) == _contract(schema):
+                names.release(schema)
+                return other
+    names.read.setdefault(same, []).append(schema)
+    names.done(schema)
+    return schema
+
+
+def _contract(schema: Schema) -> tuple[Any, ...]:
+    """What a written class says: its fields as written, and its notes."""
+    return (
+        [
+            (
+                spec.name,
+                spec.type,
+                spec.required,
+                spec.default,
+                spec.source,
+                spec.write_only,
+                spec.notes,
+            )
+            for spec in schema.fields
+        ],
+        schema.notes,
+    )
+
+
+def _read_fields(
+    serializer: Any, direction: str, names: _Names, schema: Schema
+) -> None:
+    from rest_framework.fields import HiddenField, SerializerMethodField
 
     trimmed = []
     for field_name, drf_field in serializer.fields.items():
@@ -195,6 +274,14 @@ def _read_serializer(
             trimmed.append(field_name)
             notes = [note for note in notes if note != _TRIMS]
         spec = Spec(field_name, type_, notes=notes)
+        if drf_field.source not in (None, field_name) and not isinstance(
+            drf_field, SerializerMethodField
+        ):
+            source = drf_field.source
+            if source.isidentifier() and not keyword.iskeyword(source):
+                spec.source = source
+            else:
+                notes.append(f"{TODO} source={source!r} is not converted.")
         if direction != "out":
             _read_drf_presence(drf_field, spec)
         _note_validators(drf_field, spec)
@@ -211,8 +298,6 @@ def _read_serializer(
             f"DRF strips surrounding whitespace from {', '.join(trimmed)} before validating;"
             " these fields do not."
         )
-    names.done(schema)
-    return schema
 
 
 def _read_drf_presence(drf_field: Any, spec: Spec) -> None:
@@ -246,12 +331,14 @@ def _note_validators(drf_field: Any, spec: Spec) -> None:
 
 def _built_validators(drf_field: Any) -> list[Any]:
     """The validators the field builds from its own options, without ``validators=``."""
+    from rest_framework.fields import Field
     from rest_framework.serializers import BaseSerializer
 
     if isinstance(drf_field, BaseSerializer):
         return []
     kwargs = {
-        key: value
+        # A bound ``child`` cannot be given again; DRF's copy is unbound.
+        key: copy.deepcopy(value) if isinstance(value, Field) else value
         for key, value in getattr(drf_field, "_kwargs", {}).items()
         if key != "validators"
     }
@@ -316,9 +403,10 @@ def _read_drf_type(
         schema = _read_serializer(
             nested, variant, names, f"{_base_name(type(nested).__name__)}{suffix}"
         )
-        ref = T("ref", ref=schema)
         if not many:
             return T("ref", ref=schema, nullable=nullable)
+        # The list and its items allow null apart (``many=True`` gives both).
+        ref = T("ref", ref=schema, nullable=bool(getattr(nested, "allow_null", False)))
         constraints: Any = _length(
             drf_field, allow_empty=getattr(drf_field, "allow_empty", True)
         )
@@ -331,6 +419,10 @@ def _read_drf_type(
         scalar = "int" if kind is f.IntegerField else "float"
         return T(scalar, constraints=_bounds(drf_field), nullable=nullable)
     if kind is f.DecimalField:
+        notes.append(
+            f"{TODO} DRF counts trailing decimal zeros in precision checks; "
+            "pydantic does not. Decimal output quantization is not converted."
+        )
         constraints = dict(_bounds(drf_field))
         for option in ("max_digits", "decimal_places"):
             if getattr(drf_field, option) is not None:
@@ -345,6 +437,10 @@ def _read_drf_type(
         f.JSONField: "any",
     }
     if kind in simple:
+        if kind in (f.DateField, f.TimeField, f.DateTimeField):
+            _note_temporal_formats(drf_field, direction, notes)
+        elif kind is f.JSONField and not nullable:
+            notes.append(f"{TODO} Any accepts null; this JSONField does not.")
         return T(simple[kind], nullable=nullable)
     if kind is f.ChoiceField:
         values = tuple(drf_field.choices)
@@ -352,7 +448,10 @@ def _read_drf_type(
             values = (*values, "")
         return T("literal", values=values, nullable=nullable)
     if kind is f.MultipleChoiceField:
-        item = T("literal", values=tuple(drf_field.choices))
+        choices = tuple(drf_field.choices)
+        if drf_field.allow_blank and "" not in choices:
+            choices = (*choices, "")
+        item = T("literal", values=choices)
         constraints = () if drf_field.allow_empty else (("min_length", 1),)
         notes.append("DRF returns a set; this is a list.")
         return T("list", item=item, constraints=constraints, nullable=nullable)
@@ -377,15 +476,37 @@ def _read_drf_type(
     return T("any")
 
 
+def _note_temporal_formats(field: Any, direction: str, notes: list[str]) -> None:
+    from rest_framework import ISO_8601, fields
+    from rest_framework.settings import api_settings
+
+    prefix = {
+        fields.DateField: "DATE",
+        fields.TimeField: "TIME",
+        fields.DateTimeField: "DATETIME",
+    }[type(field)]
+    if direction != "out":
+        formats = getattr(
+            field, "input_formats", getattr(api_settings, prefix + "_INPUT_FORMATS")
+        )
+        if list(formats) != [ISO_8601]:
+            notes.append(f"{TODO} input_formats={formats!r} is not converted.")
+    if direction != "in":
+        format_ = getattr(field, "format", getattr(api_settings, prefix + "_FORMAT"))
+        if format_ != ISO_8601:
+            notes.append(f"{TODO} format={format_!r} is not converted.")
+
+
 def _read_text(drf_field: Any, notes: list[str], nullable: bool) -> T:
     from rest_framework import fields as f
 
     kind = type(drf_field)
     constraints = dict(_length(drf_field, allow_empty=drf_field.allow_blank))
-    if kind is f.SlugField:
-        constraints["pattern"] = _SLUG_PATTERN
-    elif kind is f.RegexField:
-        constraints["pattern"] = _regex_of(drf_field)
+    if kind in (f.SlugField, f.RegexField):
+        # DRF's own regex (a Unicode slug's too), with its flags.
+        pattern = _regex_of(drf_field)
+        if pattern is not None:
+            constraints["pattern"] = pattern
     elif kind in (f.EmailField, f.URLField):
         notes.append(f"{TODO} {kind.__name__} format validation is not converted.")
     if drf_field.allow_blank:
@@ -405,21 +526,35 @@ def _allow_blank(constraints: dict[str, Any], notes: list[str]) -> None:
         )
     pattern = constraints.get("pattern")
     if pattern is not None:
-        if pattern.startswith("(?"):
-            # Inline flags must lead the pattern.
-            del constraints["pattern"]
-            notes.append(
-                f"{TODO} the pattern {pattern!r} of a blank-able field is not converted."
-            )
-        else:
-            constraints["pattern"] = f"^$|{pattern}"
+        # Inline flags must lead the pattern: the blank alternative follows.
+        flags = _INLINE_FLAGS.match(pattern)
+        lead = flags[0] if flags else ""
+        constraints["pattern"] = f"{lead}^$|{pattern[len(lead) :]}"
+
+
+# ``re`` flags as inline flags; ``re.UNICODE`` is a str pattern's default.
+_FLAG_LETTERS = (
+    (re.ASCII, "a"),
+    (re.IGNORECASE, "i"),
+    (re.MULTILINE, "m"),
+    (re.DOTALL, "s"),
+    (re.VERBOSE, "x"),
+)
+_INLINE_FLAGS = re.compile(r"\(\?[aimsx]+\)")
 
 
 def _regex_of(drf_field: Any) -> str | None:
+    """The pattern of the field's regex validator, its flags inline."""
     for validator in drf_field.validators:
         regex = getattr(validator, "regex", None)
-        if regex is not None:
-            return regex.pattern
+        if regex is None:
+            continue
+        if isinstance(regex, str):
+            return regex
+        letters = "".join(
+            letter for flag, letter in _FLAG_LETTERS if regex.flags & flag
+        )
+        return f"(?{letters}){regex.pattern}" if letters else regex.pattern
     return None
 
 
@@ -504,7 +639,17 @@ def _read_pydantic(model: Any, names: _Names, name: str) -> Schema:
         type_ = _read_annotation(
             info.annotation, info.metadata, names, notes, "pydantic"
         )
+        type_ = _with_model_text_limits(type_, model.model_config)
         spec = Spec(attr, type_, notes=notes)
+        validates_default = (
+            info.validate_default
+            if info.validate_default is not None
+            else model.model_config.get("validate_default", False)
+        )
+        if not info.is_required() and validates_default:
+            notes.append(
+                f"{TODO} validate_default=True is not converted; DRF does not validate defaults."
+            )
         alias = (
             info.validation_alias
             if isinstance(info.validation_alias, str)
@@ -539,9 +684,19 @@ def _read_pydantic(model: Any, names: _Names, name: str) -> Schema:
             )
     for computed in sorted(decorators.computed_fields):
         schema.notes.append(f"{TODO} the computed field {computed!r} is not converted.")
-    if "model_post_init" in vars(model):
+    hook = _project_hook(model, "model_post_init")
+    if hook is not None:
+        schema.notes.append(f"{TODO} {hook}.model_post_init() is not converted.")
+    for option in ("str_strip_whitespace", "str_to_lower", "str_to_upper"):
+        if model.model_config.get(option):
+            schema.notes.append(f"{TODO} the model's {option} is not converted.")
+    if model.model_config.get("extra") == "forbid":
         schema.notes.append(
-            f"{TODO} {model.__name__}.model_post_init() is not converted."
+            f"{TODO} unknown fields are refused by pydantic; DRF ignores them."
+        )
+    elif model.model_config.get("extra") == "allow":
+        schema.notes.append(
+            f"{TODO} extra='allow' is not converted; DRF discards extra fields."
         )
     names.done(schema)
     return schema
@@ -595,12 +750,69 @@ def _read_msgspec(struct: Any, names: _Names, name: str) -> Schema:
         if _is_unset(type_):
             spec.required = False
         schema.fields.append(spec)
-    if "__post_init__" in vars(struct):
+    hook = _project_hook(struct, "__post_init__")
+    if hook is not None:
+        schema.notes.append(f"{TODO} {hook}.__post_init__() is not converted.")
+    config = struct.__struct_config__
+    if config.omit_defaults:
         schema.notes.append(
-            f"{TODO} {struct.__name__}.__post_init__() is not converted."
+            f"{TODO} omit_defaults=True is not converted; DRF represents default values."
+        )
+    if config.tag is not None:
+        schema.notes.append(
+            f"{TODO} the tag {config.tag_field}={config.tag!r} is not converted: "
+            "msgspec checks it in input and writes it in output."
+        )
+    if config.array_like:
+        schema.notes.append(
+            f"{TODO} array_like is not converted: msgspec reads and writes "
+            f"{struct.__name__} as an array of its fields."
+        )
+    if config.forbid_unknown_fields:
+        schema.notes.append(
+            f"{TODO} unknown fields are refused by msgspec; DRF ignores them."
         )
     names.done(schema)
     return schema
+
+
+def _project_hook(cls: type, name: str) -> str | None:
+    """
+    The name of the class that defines the hook ``name`` that ``cls`` runs,
+    inherited too, when it is not the library's (pydantic sets its own
+    ``model_post_init`` on a model with private attributes).
+    """
+    for klass in cls.__mro__:
+        if name in vars(klass):
+            function = vars(klass)[name]
+            module = getattr(function, "__module__", "") or ""
+            if module.split(".", 1)[0] in ("pydantic", "msgspec"):
+                return None
+            return klass.__name__
+    return None
+
+
+def _with_model_text_limits(type_: T, config: Any) -> T:
+    """
+    ``type_`` with the model's ``str_min_length`` and ``str_max_length``
+    on each string it holds that does not set its own.
+    """
+    limits = {
+        constraint: config.get(option)
+        for constraint, option in (
+            ("min_length", "str_min_length"),
+            ("max_length", "str_max_length"),
+        )
+        if config.get(option) is not None
+    }
+    if not limits:
+        return type_
+    if type_.kind == "str":
+        own = dict(type_.constraints)
+        return _with(type_, constraints=tuple({**limits, **own}.items()))
+    if type_.item is not None:
+        return _with(type_, item=_with_model_text_limits(type_.item, config))
+    return type_
 
 
 def _factory_default(spec: Spec, factory: Callable[[], Any]) -> None:
@@ -614,7 +826,7 @@ def _factory_default(spec: Spec, factory: Callable[[], Any]) -> None:
 
 
 def _rename(spec: Spec, attr: str, wire_name: str | None) -> None:
-    if not wire_name or wire_name == attr:
+    if wire_name is None or wire_name == attr:
         return
     if wire_name.isidentifier() and not keyword.iskeyword(wire_name):
         spec.name, spec.source = wire_name, attr
@@ -741,14 +953,29 @@ def _read_annotation(
             constraints=inner.constraints + unset_mark,
         )
     if annotation in _SCALARS:
-        return T(_SCALARS[annotation], constraints=tuple(constraints.items()))
+        return T(
+            _SCALARS[annotation],
+            constraints=tuple(constraints.items()),
+            nullable=annotation is Any,
+        )
     if origin is typing.Literal:
-        return T("literal", values=typing.get_args(annotation))
+        values = typing.get_args(annotation)
+        # ``None`` among the members is null, which DRF allows apart.
+        return T(
+            "literal",
+            values=tuple(value for value in values if value is not None),
+            nullable=None in values,
+            constraints=tuple(constraints.items()),
+        )
     if isinstance(annotation, type) and issubclass(annotation, enum.Enum):
         notes.append(
             f"{annotation.__name__} members by value; DRF returns the raw value."
         )
-        return T("literal", values=tuple(member.value for member in annotation))
+        return T(
+            "literal",
+            values=tuple(member.value for member in annotation),
+            constraints=tuple(constraints.items()),
+        )
     if origin is list:
         (item,) = typing.get_args(annotation) or (Any,)
         return T(
@@ -980,41 +1207,75 @@ def _to_schema_source(schemas: Iterable[Schema], source_path: str, library: str)
         if library == "pydantic"
         else "import msgspec"
     )
+    schemas = list(schemas)
+    names = {*_GENERATED_REFERENCES, *(schema.name for schema in schemas)}
+    references = {
+        *(value.split(".")[0] for value in _SCHEMA_SCALARS.values()),
+        *(schema.name for schema in schemas),
+        "list",
+        "dict",
+        "Annotated",
+        "Literal",
+        "Field",
+        "BaseModel",
+        "ConfigDict",
+        "msgspec",
+    }
     blocks = []
-    uses_field = False
+    uses_field = uses_config = False
     for schema in schemas:
         aliases, body = [], [f"    # {note}" for note in schema.notes]
         kw_only = seen_default = False
-        taken = {spec.name for spec in schema.fields}
+        attributes: set[str] = set()
+        taken = (
+            {spec.name for spec in schema.fields}
+            | {spec.source for spec in schema.fields if spec.source}
+            | names
+        )
         for spec in schema.fields:
             default, type_, notes = _schema_default(spec, imports, library)
+            has_default = default is not None
             annotation = _annotation(type_, imports, library, notes)
-            attribute = spec.name
-            if library == "pydantic" and spec.name.startswith("_"):
-                # pydantic makes such an attribute private: rename it and
-                # keep the wire name as the alias.
-                attribute = spec.name.lstrip("_") + "_"
-                if attribute in taken or not attribute.isidentifier():
-                    attribute = spec.name
-                    notes.append(
-                        f"{TODO} pydantic ignores a field named {spec.name!r}."
-                    )
-                else:
-                    taken.add(attribute)
+            attribute = spec.source or spec.name
+            if attribute in references or (
+                library == "pydantic" and attribute.startswith(("_", "model_"))
+            ):
+                candidate = (attribute.lstrip("_") or "field") + "_"
+                if candidate.startswith("model_"):
+                    candidate = "field_" + candidate
+                attribute = _unused(candidate, taken)
+            if not attribute.isidentifier() or keyword.iskeyword(attribute):
+                attribute = _unused("field_", taken)
+            if attribute in attributes:
+                notes.append(f"{TODO} shared source={spec.source!r} is not converted.")
+                attribute = _unused(attribute + "_", taken)
+            attributes.add(attribute)
+            if attribute != spec.name:
+                wire = _string(spec.name)
+                if library == "pydantic":
                     given = f"{default}, " if default is not None else ""
-                    default = f"Field({given}alias={_string(spec.name)})"
+                    default = f"Field({given}alias={wire})"
+                elif default is not None and default.startswith("msgspec.field("):
+                    default = default[:-1] + f", name={wire})"
+                else:
+                    given = f", default={default}" if default is not None else ""
+                    default = f"msgspec.field(name={wire}{given})"
             uses_field = (
                 uses_field or "Field(" in annotation or "Field(" in (default or "")
             )
-            if default is None and seen_default and library == "msgspec":
+            if not has_default and seen_default and library == "msgspec":
                 kw_only = True
-            seen_default = seen_default or default is not None
+            seen_default = seen_default or has_default
             assigned = f" = {default}" if default is not None else ""
             line = f"{attribute}: {annotation}{assigned}"
             if len("    " + line) > LINE_LENGTH:
                 core, rest = _split_annotation(annotation)
                 if core.endswith("]"):
-                    alias = f"{schema.name}{_pascal(attribute)}"
+                    # The alias is read inside the class: neither existing nor
+                    # later field attributes may shadow its module-level name.
+                    alias = _unused(f"{schema.name}{_pascal(attribute)}", names | taken)
+                    names.add(alias)
+                    taken.add(alias)
                     aliases.extend(_wrap("", f"{alias} = {core}"))
                     line = f"{attribute}: {alias}{rest}{assigned}"
             body.extend(f"    # {note}" for note in [*spec.notes, *notes])
@@ -1022,6 +1283,19 @@ def _to_schema_source(schemas: Iterable[Schema], source_path: str, library: str)
         base = "BaseModel" if library == "pydantic" else "msgspec.Struct"
         if kw_only:
             base += ", kw_only=True"
+        if library == "pydantic":
+            options = []
+            if any(_has_pattern(spec.type) for spec in schema.fields):
+                options.append('regex_engine="python-re"')
+            if any(spec.source for spec in schema.fields):
+                # Attributes used by output need to be readable by name too.
+                options.append("populate_by_name=True")
+                body.insert(
+                    0, "    # Input accepts attribute names as well as wire aliases."
+                )
+            if options:
+                uses_config = True
+                body.insert(0, f"    model_config = ConfigDict({', '.join(options)})")
         if not schema.fields:
             # Notes are comments: the class still needs a statement.
             body.append("    pass")
@@ -1029,9 +1303,29 @@ def _to_schema_source(schemas: Iterable[Schema], source_path: str, library: str)
         if aliases:
             block = "\n".join(aliases) + "\n\n\n" + block
         blocks.append(block)
-    if library == "pydantic" and not uses_field:
-        imports.third_party[0] = "from pydantic import BaseModel"
+    if library == "pydantic":
+        used = ["BaseModel"]
+        if uses_config:
+            used.append("ConfigDict")
+        if uses_field:
+            used.append("Field")
+        imports.third_party[0] = f"from pydantic import {', '.join(used)}"
     return _module(source_path, imports, blocks)
+
+
+def _unused(name: str, names: set[str]) -> str:
+    unique, number = name, 2
+    while unique in names:
+        unique, number = f"{name}{number}", number + 1
+    names.add(unique)
+    return unique
+
+
+def _has_pattern(type_: T | None) -> bool:
+    return type_ is not None and (
+        any(name == "pattern" for name, _ in type_.constraints)
+        or _has_pattern(type_.item)
+    )
 
 
 def _pascal(name: str) -> str:
@@ -1071,7 +1365,19 @@ def _core_annotation(
         if text == "Any":
             imports.typing.add("Any")
     elif kind == "literal":
-        choices = _choices(type_, imports, notes)
+        if library == "msgspec" and any(
+            type(value) not in (str, int)
+            or (type(value) is int and not -(2**63) <= value < 2**63)
+            for value in type_.values
+        ):
+            # The supported msgspec versions share string/integer Literal
+            # support (signed 64-bit integers), not float or boolean Literals.
+            notes.append(
+                f"{TODO} these choices are not supported by msgspec Literal: {type_.values!r}."
+            )
+            choices = None
+        else:
+            choices = _choices(type_, imports, notes)
         if choices is None:
             imports.typing.add("Any")
             text = "Any"
@@ -1171,9 +1477,12 @@ def to_drf(schemas: Iterable[Schema], source_path: str) -> str:
             expression = _drf_field(spec.type, imports, notes, written, top=spec)
             body.extend(f"    # {note}" for note in notes)
             body.extend(_wrap("    ", f"{spec.name} = {expression}"))
+        if not schema.fields:
+            # Notes are comments: the class still needs a statement.
+            body.append("    pass")
         blocks.append(
             f"class {schema.name}Serializer(serializers.Serializer):\n"
-            + ("\n".join(body) or "    pass")
+            + "\n".join(body)
         )
         written.add(schema.name)
     return _module(source_path, imports, blocks)
@@ -1195,6 +1504,16 @@ def _drf_field(
         kind = "any"
     if kind == "ref":
         name = f"{type_.ref.name}Serializer"
+    elif (
+        kind == "list"
+        and type_.item.kind == "ref"
+        and type_.nullable
+        and not type_.item.nullable
+    ):
+        # ``many=True`` would pass ``allow_null`` to the items too.
+        name = "serializers.ListSerializer"
+        options.append(("child", f"{type_.item.ref.name}Serializer()"))
+        options.extend(_drf_lengths(constraints))
     elif kind == "list" and type_.item.kind == "ref":
         name = f"{type_.item.ref.name}Serializer"
         options.append(("many", "True"))
@@ -1211,9 +1530,19 @@ def _drf_field(
             if "pattern" in constraints
             else "serializers.CharField"
         )
-        if "pattern" in constraints:
-            options.append(("regex", _string(constraints.pop("pattern"))))
         blank = not constraints.get("min_length")
+        if "pattern" in constraints:
+            pattern = constraints.pop("pattern")
+            try:
+                accepts_blank = re.search(pattern, "") is not None
+            except re.error:
+                name = "serializers.CharField"
+                notes.append(
+                    f"{TODO} pattern={pattern!r} is not supported by Python re."
+                )
+            else:
+                options.append(("regex", _string(pattern)))
+                blank = blank and accepts_blank
         options.extend(_drf_lengths(constraints))
         if blank:
             options.append(("allow_blank", "True"))
@@ -1225,12 +1554,22 @@ def _drf_field(
             "decimal": "serializers.DecimalField",
         }[kind]
         if kind == "decimal":
+            if "max_digits" in constraints or "decimal_places" in constraints:
+                notes.append(
+                    f"{TODO} DRF counts trailing decimal zeros in precision checks; pydantic does not."
+                )
             options.extend(
                 (option, repr(constraints.pop(option, None)))
                 for option in ("max_digits", "decimal_places")
             )
         options.extend(_drf_bounds(constraints, kind, imports))
-    elif kind == "literal" and (choices := _choices(type_, imports, notes)):
+    elif kind == "literal" and not type_.values and type_.nullable:
+        # ``Literal[None]``: null only.
+        name = "serializers.ChoiceField"
+        options.append(("choices", "[]"))
+    elif kind == "literal" and (
+        choices := _choices(_chosen(type_, constraints), imports, notes)
+    ):
         name = "serializers.ChoiceField"
         options.append(("choices", f"[{choices}]"))
     elif kind == "list":
@@ -1262,6 +1601,35 @@ def _drf_field(
     if top is not None:
         options.extend(_drf_presence(top, imports, notes))
     return f"{name}({', '.join(f'{key}={value}' for key, value in options)})"
+
+
+_CHOICE_CHECKS: dict[str, Callable[[Any, Any], bool]] = {
+    "min_length": lambda value, limit: len(value) >= limit,
+    "max_length": lambda value, limit: len(value) <= limit,
+    "ge": lambda value, limit: value >= limit,
+    "gt": lambda value, limit: value > limit,
+    "le": lambda value, limit: value <= limit,
+    "lt": lambda value, limit: value < limit,
+    "multiple_of": lambda value, limit: value % limit == 0,
+    "pattern": lambda value, limit: re.search(limit, value) is not None,
+}
+
+
+def _chosen(type_: T, constraints: dict[str, Any]) -> T:
+    """
+    The literal ``type_`` with the members its constraints allow: a choice
+    either passes a constraint or not. The constraints checked are removed
+    from ``constraints``; one a member cannot be checked against stays.
+    """
+    values = type_.values
+    for name in [name for name in constraints if name in _CHOICE_CHECKS]:
+        check, limit = _CHOICE_CHECKS[name], constraints[name]
+        try:
+            values = tuple(value for value in values if check(value, limit))
+        except (TypeError, re.error):
+            continue
+        del constraints[name]
+    return _with(type_, values=values)
 
 
 def _unwritten_ref(type_: T, notes: list[str], written: set[str]) -> bool:

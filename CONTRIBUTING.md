@@ -38,9 +38,10 @@ sessions with `uv run nox -l`:
 | --- | --- |
 | `tests-<python>(django<x>-drf<y>)` | The suite on Python 3.12, 3.13 and 3.14 for each supported Django and DRF pair, for example `uv run nox -s "tests-3.14(django6.1-drf3.18)"`. |
 | `freethreaded` | The suite on free-threaded Python 3.14t. |
-| `tests_minimum` | The suite at the declared minimum versions of Django, DRF, msgspec and pydantic. |
+| `tests_minimum` | The suite at the declared minimum versions of Django, DRF and every extra. |
 | `tests_without_extras` | The `drf` and `python` backend tests with neither msgspec nor pydantic installed. |
 | `differential(django<x>-drf<y>)` | The same requests to DRF's viewsets and to fastdrf's options, compared. |
+| `contrib_install(extra=...)` | Each `fastdrf.contrib` application installed with its extra alone (`tools/check_contrib.py`), so that a dependency the extra misses fails. |
 | `lint` | `ruff check` and `ruff format --check`. |
 
 To check the built package as CI does:
@@ -94,14 +95,23 @@ the input recognizers, the kept JSON encoder) is listed in
 supported DRF version. When a DRF release changes one, the test names the
 counterpart to read again; bring it in line, then add the new digest.
 
+### Names aiodrf uses
+
+django-aiodrf runs this package's machinery asynchronously and imports some
+private names from their modules (the input batching, the compiled
+producers, the response's data rendering). They are not public API, but a
+rename breaks the aiodrf release that pins this version.
+`tests/test_shared_internals.py` lists them: change one together with
+aiodrf, and keep the list in step with what aiodrf imports.
+
 ## Pull requests
 
 - Open pull requests against the `dev` branch. `main` receives `dev` at
   release time; a workflow closes other pull requests into `main` with a
   pointer to `dev`.
 - CI runs lint, the full suite with coverage, the nox matrix and the
-  `freethreaded`, `tests_minimum`, `tests_without_extras` and `differential`
-  sessions, and builds and checks the package. A pull request from someone
+  `freethreaded`, `tests_minimum`, `tests_without_extras`, `differential` and
+  `contrib_install` sessions, and builds and checks the package. A pull request from someone
   other than the maintainer waits for the maintainer's approval before CI
   runs.
 - Keep a pull request to one change, and describe what it changes for users

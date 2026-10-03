@@ -2,6 +2,7 @@
 
 import datetime
 import enum
+import re
 import shutil
 import subprocess
 import sys
@@ -24,6 +25,52 @@ from fastdrf import convert
 from tests.models import Book
 
 TODO = convert.TODO
+
+
+@pytest.mark.parametrize("to", ["pydantic", "msgspec"])
+@pytest.mark.parametrize("collision_first", [False, True])
+@pytest.mark.parametrize("source_name", [False, True])
+def test_generated_annotation_alias_does_not_shadow_field(
+    to, collision_first, source_name
+):
+    wire = "public" if source_name else "LongValue"
+    fields = {
+        wire: serializers.IntegerField(
+            default=1, **({"source": "LongValue"} if source_name else {})
+        ),
+        "value": serializers.RegexField(
+            r"^[abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]+$",
+            max_length=100,
+        ),
+    }
+    if not collision_first:
+        fields = dict(reversed(list(fields.items())))
+    source = type("LongSerializer", (serializers.Serializer,), fields)
+    schema = load(generate(source, to))["Long"]
+    body = {wire: 1, "value": "abc"}
+    if to == "pydantic":
+        assert schema.model_validate(body).model_dump(by_alias=True) == body
+    else:
+        assert msgspec.to_builtins(msgspec.convert(body, schema)) == body
+
+
+@pytest.mark.parametrize("renamed", ["public", "list"])
+@pytest.mark.parametrize("required_first", [False, True])
+def test_msgspec_required_alias_keeps_default_ordering(renamed, required_first):
+    fields = {
+        "count": serializers.IntegerField(default=1),
+        renamed: serializers.IntegerField(
+            **({"source": "internal"} if renamed == "public" else {})
+        ),
+    }
+    if required_first:
+        fields = dict(reversed(list(fields.items())))
+    source = type("RenamedSerializer", (serializers.Serializer,), fields)
+    schema = load(generate(source, "msgspec"))["Renamed"]
+    assert msgspec.to_builtins(msgspec.convert({renamed: 2}, schema)) == {
+        "count": 1,
+        renamed: 2,
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -865,3 +912,692 @@ def test_the_output_file_is_utf_8_whatever_the_locale(tmp_path, monkeypatch):
         stdout=StringIO(),
     )
     assert written == ["utf-8"]
+
+
+# -- One class per contract ------------------------------------------------------------
+
+
+class Limited(serializers.Serializer):
+    def __init__(self, *args, limit=3, **kwargs):
+        self.limit = limit
+        super().__init__(*args, **kwargs)
+
+    def get_fields(self):
+        return {"name": serializers.CharField(max_length=self.limit)}
+
+
+class Pair(serializers.Serializer):
+    short = Limited(limit=3)
+    long = Limited(limit=10)
+    again = Limited(limit=3)
+
+
+@pytest.mark.parametrize("to", ["pydantic", "msgspec"])
+def test_instances_of_one_serializer_class_with_other_options_get_their_own_class(to):
+    schemas = convert.from_serializer(Pair())
+    pair = schemas[-1]
+    names = {spec.name: spec.type for spec in pair.fields}
+    # The same options share a class; others have their own.
+    assert names["short"] == names["again"]
+    assert names["short"] != names["long"]
+    writer = convert.to_pydantic if to == "pydantic" else convert.to_msgspec
+    namespace = load(writer(schemas, "tests.Pair"))
+    data = {
+        "short": {"name": "abc"},
+        "long": {"name": "abcdef"},
+        "again": {"name": "x"},
+    }
+    assert Pair(data=data).is_valid()
+    if to == "pydantic":
+        namespace["Pair"].model_validate(data)
+        with pytest.raises(ValidationError):
+            namespace["Pair"].model_validate({**data, "short": {"name": "abcdef"}})
+    else:
+        msgspec.convert(data, namespace["Pair"])
+        with pytest.raises(msgspec.ValidationError):
+            msgspec.convert({**data, "short": {"name": "abcdef"}}, namespace["Pair"])
+
+
+# -- Generated names --------------------------------------------------------------
+
+
+class FieldSerializer(serializers.Serializer):
+    value = serializers.IntegerField()
+
+
+class BaseModelSerializer(serializers.Serializer):
+    hidden = serializers.IntegerField()
+
+
+class AnnotatedSerializer(serializers.Serializer):
+    value = serializers.IntegerField(min_value=1)
+
+
+class ShadowingSerializer(serializers.Serializer):
+    field = FieldSerializer()
+    base = BaseModelSerializer()
+    annotated = AnnotatedSerializer()
+    label = serializers.CharField(max_length=10)
+
+
+@pytest.mark.parametrize("to", ["pydantic", "msgspec"])
+def test_class_names_do_not_shadow_the_modules_imports(to):
+    namespace = load(generate(ShadowingSerializer, to))
+    schema = namespace["Shadowing"]
+    good = {
+        "field": {"value": 1},
+        "base": {"hidden": 1},
+        "annotated": {"value": 1},
+        "label": "ok",
+    }
+    if to == "pydantic":
+        assert set(schema.model_fields) == set(good)
+        assert schema.model_validate(good).label == "ok"
+        with pytest.raises(ValidationError):
+            schema.model_validate({**good, "label": "x" * 11})
+    else:
+        assert schema.__struct_fields__ == tuple(good)
+        assert msgspec.convert(good, schema).label == "ok"
+        with pytest.raises(msgspec.ValidationError):
+            msgspec.convert({**good, "label": "x" * 11}, schema)
+
+
+class BoundedList(serializers.Serializer):
+    values = serializers.ListField(child=serializers.IntegerField(), max_length=3)
+
+
+def test_a_list_fields_own_length_validators_are_not_marked():
+    (schema,) = convert.from_serializer(BoundedList())
+    (spec,) = schema.fields
+    assert spec.type.constraints
+    assert not any("is not converted" in note for note in spec.notes)
+
+
+# -- What the generated DRF serializer accepts, the source schema accepts ----------
+
+
+class NullChild(BaseModel):
+    value: int
+
+
+class NullableList(BaseModel):
+    children: list[NullChild] | None
+
+
+class NullableBoth(BaseModel):
+    children: list[NullChild | None] | None
+
+
+class NullableNone(BaseModel):
+    children: list[NullChild]
+
+
+def _accepts(model, data):
+    try:
+        model.model_validate(data)
+    except ValidationError:
+        return False
+    return True
+
+
+@pytest.mark.parametrize("model", [NullableList, NullableBoth, NullableNone])
+@pytest.mark.parametrize(
+    "children", [None, [None], [], [{"value": 1}], [{"value": 1}, None]]
+)
+def test_list_and_item_nullability_are_converted_apart(model, children):
+    serializer = _generated_serializer(model)(data={"children": children})
+    assert serializer.is_valid() == _accepts(model, {"children": children})
+
+
+class NullLiteral(BaseModel):
+    text: Literal[None, "x"]
+    number: Literal[None, 1]
+    only: Literal[None]
+    items: list[Literal[None, "x"]] = []
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"text": None, "number": None, "only": None},
+        {"text": "x", "number": 1, "only": None, "items": [None, "x"]},
+        {"text": "y", "number": None, "only": None},
+        {"text": None, "number": 2, "only": None},
+        {"text": None, "number": None, "only": "x"},
+        {"text": None, "number": None, "only": None, "items": ["y"]},
+        {"number": None, "only": None},
+    ],
+)
+def test_none_in_a_literal_is_null(data):
+    assert _generated_serializer(NullLiteral)(data=data).is_valid() == _accepts(
+        NullLiteral, data
+    )
+
+
+class ConstrainedLiteral(BaseModel):
+    text: Annotated[Literal["abc", "abcdef"], Field(min_length=5)]
+    number: Annotated[Literal[1, 5, 10], Field(ge=5, lt=10)]
+    pattern: Annotated[Literal["ab", "cd"], Field(pattern="^a")]
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"text": "abcdef", "number": 5, "pattern": "ab"},
+        {"text": "abc", "number": 5, "pattern": "ab"},
+        {"text": "abcdef", "number": 1, "pattern": "ab"},
+        {"text": "abcdef", "number": 10, "pattern": "ab"},
+        {"text": "abcdef", "number": 5, "pattern": "cd"},
+    ],
+)
+def test_the_constraints_of_a_literal_choose_its_choices(data):
+    serializer = _generated_serializer(ConstrainedLiteral)(data=data)
+    assert serializer.is_valid() == _accepts(ConstrainedLiteral, data)
+    source = convert.to_drf(convert.from_pydantic(ConstrainedLiteral), "tests.X")
+    assert "is not converted" not in source
+
+
+class Tagged(msgspec.Struct, tag="book", tag_field="kind"):
+    value: int
+
+
+class Rows(msgspec.Struct, array_like=True):
+    value: int
+
+
+class Strict(msgspec.Struct, forbid_unknown_fields=True):
+    value: int
+
+
+class Closed(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    value: int
+
+
+@pytest.mark.parametrize(
+    ("source", "note"),
+    [
+        (Tagged, "the tag kind='book'"),
+        (Rows, "array_like"),
+        (Strict, "unknown fields"),
+        (Closed, "unknown fields"),
+    ],
+)
+def test_a_wire_format_drf_has_no_equal_for_is_marked(source, note):
+    text = generate(source, "drf")
+    assert any(
+        "TODO(convert)" in line and note in line for line in text.splitlines()
+    ), text
+
+
+# -- Loadable output, regex options, nullable items ------------------------------------
+
+
+class EmptyClosed(BaseModel):
+    model_config = {"extra": "forbid"}
+
+
+class EmptyTagged(msgspec.Struct, tag="empty"):
+    pass
+
+
+@pytest.mark.parametrize("source", [EmptyClosed, EmptyTagged])
+def test_a_class_with_notes_only_is_python(source):
+    namespace = load(generate(source, "drf"))
+    assert namespace[f"{source.__name__}Serializer"](data={}).is_valid()
+
+
+class Insensitive(serializers.Serializer):
+    value = serializers.RegexField(re.compile(r"^abc$", re.IGNORECASE | re.MULTILINE))
+
+
+class InsensitiveBlank(serializers.Serializer):
+    value = serializers.RegexField(
+        re.compile(r"^abc$", re.IGNORECASE), allow_blank=True
+    )
+
+
+class UnicodeSlug(serializers.Serializer):
+    value = serializers.SlugField(allow_unicode=True)
+
+
+class AsciiSlug(serializers.Serializer):
+    value = serializers.SlugField()
+
+
+class Lookahead(serializers.Serializer):
+    value = serializers.RegexField(r"^(?=a)a+$")
+
+
+class Backreference(serializers.Serializer):
+    value = serializers.RegexField(r"^(a)\1$")
+
+
+def _target_accepts(namespace, name, to, data):
+    schema = namespace[name]
+    try:
+        if to == "pydantic":
+            schema.model_validate(data)
+        else:
+            msgspec.convert(data, schema)
+    except (ValidationError, msgspec.ValidationError):
+        return False
+    return True
+
+
+@pytest.mark.parametrize("to", ["pydantic", "msgspec"])
+@pytest.mark.parametrize(
+    ("source", "values"),
+    [
+        (Insensitive, ["ABC", "abc", "abd"]),
+        (InsensitiveBlank, ["ABC", "", "abd"]),
+        (UnicodeSlug, ["istanbul-çığ", "a b", "x"]),
+        (AsciiSlug, ["istanbul-çığ", "abc", "abc\n"]),
+        (Lookahead, ["aaa", "b"]),
+        (Backreference, ["aa", "ab"]),
+    ],
+)
+def test_a_pattern_keeps_its_python_meaning(to, source, values):
+    namespace = load(generate(source, to))
+    name = source.__name__
+    for value in values:
+        expected = source(data={"value": value}).is_valid()
+        assert _target_accepts(namespace, name, to, {"value": value}) == expected, value
+
+
+class ItemChild(serializers.Serializer):
+    value = serializers.IntegerField()
+
+
+class NullItems(serializers.Serializer):
+    children = ItemChild(many=True, allow_null=True)
+
+
+class NullItemsOnly(serializers.Serializer):
+    children = serializers.ListSerializer(child=ItemChild(allow_null=True))
+
+
+class NullListOnly(serializers.Serializer):
+    children = serializers.ListSerializer(child=ItemChild(), allow_null=True)
+
+
+@pytest.mark.parametrize("to", ["pydantic", "msgspec"])
+@pytest.mark.parametrize("source", [NullItems, NullItemsOnly, NullListOnly])
+@pytest.mark.parametrize("children", [None, [None, {"value": 1}], [], [{"value": 1}]])
+def test_list_and_item_nullability_are_read_apart(to, source, children):
+    namespace = load(generate(source, to))
+    data = {"children": children}
+    expected = source(data=data).is_valid()
+    assert _target_accepts(namespace, source.__name__, to, data) == expected
+
+
+# -- Model-wide string limits, inherited hooks, empty wire names -----------------------
+
+
+class LimitedText(BaseModel):
+    model_config = {"str_min_length": 3, "str_max_length": 5}
+
+    value: str
+    own: str = Field(min_length=1, max_length=10)
+    items: list[str] = []
+
+
+class LimitedChild(LimitedText):
+    extra: str = "abc"
+
+
+@pytest.mark.parametrize("model", [LimitedText, LimitedChild])
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"value": "a", "own": "a"},
+        {"value": "abc", "own": "a"},
+        {"value": "abcdef", "own": "a"},
+        {"value": "abc", "own": "abcdefgh"},
+        {"value": "abc", "own": "a", "items": ["ab"]},
+        {"value": "abc", "own": "a", "items": ["abcd"]},
+    ],
+)
+def test_model_wide_string_limits_are_converted(model, data):
+    assert _generated_serializer(model)(data=data).is_valid() == _accepts(model, data)
+
+
+class HookedParentStruct(msgspec.Struct):
+    value: int
+
+    def __post_init__(self):
+        if self.value < 0:
+            raise ValueError("value must be positive")
+
+
+class HookedChildStruct(HookedParentStruct):
+    pass
+
+
+class HookedParentModel(BaseModel):
+    value: int
+
+    def model_post_init(self, context):
+        if self.value < 0:
+            raise ValueError("value must be positive")
+
+
+class HookedChildModel(HookedParentModel):
+    pass
+
+
+class PrivateOnly(BaseModel):
+    value: int
+    _cache: int = 0
+
+
+@pytest.mark.parametrize(
+    ("source", "note"),
+    [
+        (HookedChildStruct, "HookedParentStruct.__post_init__()"),
+        (HookedChildModel, "HookedParentModel.model_post_init()"),
+        (PrivateOnly, None),
+    ],
+)
+def test_an_inherited_post_init_is_marked(source, note):
+    text = generate(source, "drf")
+    marked = [line for line in text.splitlines() if "post_init" in line]
+    if note is None:
+        assert not marked, text
+    else:
+        assert any("TODO(convert)" in line and note in line for line in marked), text
+
+
+class EmptyWire(msgspec.Struct, rename={"value": ""}):
+    value: int
+
+
+def test_an_empty_wire_name_is_marked():
+    text = generate(EmptyWire, "drf")
+    assert "TODO(convert): the wire name '' is not a Python name." in text
+
+
+@pytest.mark.parametrize("to", ["pydantic", "msgspec"])
+@pytest.mark.parametrize(
+    "field_class",
+    [serializers.DateField, serializers.TimeField, serializers.DateTimeField],
+)
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"input_formats": ["%Y"]},
+        {"input_formats": []},
+        {"format": "%Y"},
+        {"format": None},
+    ],
+)
+def test_temporal_formats_that_cannot_be_converted_are_marked(to, field_class, options):
+    source = type(
+        "TemporalSerializer",
+        (serializers.Serializer,),
+        {"value": field_class(**options)},
+    )
+    text = generate(source, to)
+    option = next(iter(options))
+    assert f"{TODO} {option}=" in text
+    load(text)
+
+
+def test_temporal_conversion_reads_global_format_settings():
+    from django.test import override_settings
+
+    class DatesSerializer(serializers.Serializer):
+        value = serializers.DateField()
+
+    with override_settings(
+        REST_FRAMEWORK={"DATE_FORMAT": None, "DATE_INPUT_FORMATS": []}
+    ):
+        text = generate(DatesSerializer, "pydantic")
+    assert f"{TODO} format=None" in text
+    assert f"{TODO} input_formats=[]" in text
+
+
+def test_default_omission_is_marked():
+    class Omitted(msgspec.Struct, omit_defaults=True):
+        value: int = 1
+
+    text = generate(Omitted, "drf")
+    assert f"{TODO} omit_defaults=True" in text
+    assert load(text)["OmittedSerializer"](Omitted()).data == {"value": 1}
+
+
+@pytest.mark.parametrize("library", ["pydantic", "msgspec"])
+def test_any_fields_and_container_items_accept_null(library):
+    from typing import Any
+
+    from pydantic import create_model
+
+    fields = [("value", Any), ("items", list[Any]), ("mapping", dict[str, Any])]
+    schema = (
+        create_model(
+            "Payload", **{name: (annotation, ...) for name, annotation in fields}
+        )
+        if library == "pydantic"
+        else msgspec.defstruct("Payload", fields)
+    )
+    converted = load(generate(schema, "drf"))["PayloadSerializer"]
+    serializer = converted(
+        data={"value": None, "items": [None], "mapping": {"a": None}}
+    )
+    assert serializer.is_valid(), serializer.errors
+    assert not converted(data={}).is_valid()
+
+
+@pytest.mark.parametrize("to", ["pydantic", "msgspec"])
+@pytest.mark.parametrize("nullable", [False, True])
+def test_non_nullable_json_conversion_is_explicit(to, nullable):
+    class JsonSerializer(serializers.Serializer):
+        value = serializers.JSONField(allow_null=nullable)
+
+    text = generate(JsonSerializer, to)
+    assert (f"{TODO} Any accepts null" in text) is not nullable
+    load(text)
+
+
+@pytest.mark.parametrize("to", ["pydantic", "msgspec"])
+@pytest.mark.parametrize("allow_blank", [False, True])
+@pytest.mark.parametrize("choices", [["a", "b"], ["a", ""]])
+def test_multiple_choices_keep_blank_members(to, allow_blank, choices):
+    class MultiSerializer(serializers.Serializer):
+        value = serializers.MultipleChoiceField(
+            choices=choices, allow_blank=allow_blank
+        )
+
+    schema = load(generate(MultiSerializer, to))["Multi"]
+    for value in ([], [""], ["a", ""], ["a"], ["unknown"]):
+        body = {"value": value}
+        expected = MultiSerializer(data=body).is_valid()
+        try:
+            if to == "pydantic":
+                schema.model_validate(body)
+            else:
+                msgspec.convert(body, schema)
+        except (ValidationError, msgspec.ValidationError):
+            actual = False
+        else:
+            actual = True
+        assert actual == expected
+
+
+@pytest.mark.parametrize("to", ["pydantic", "msgspec"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "list",
+        "datetime",
+        "int",
+        "Field",
+        "model_config",
+        "model_dump",
+        "model_validate",
+        "_id",
+        "_",
+    ],
+)
+def test_generated_field_names_do_not_shadow_annotations_or_model_methods(to, name):
+    source = type(
+        "NamesSerializer",
+        (serializers.Serializer,),
+        {
+            name: serializers.IntegerField(default=1),
+            "model_dump_": serializers.IntegerField(default=2),
+            "items": serializers.ListField(child=serializers.IntegerField()),
+            "stamp": serializers.DateField(),
+        },
+    )
+    schema = load(generate(source, to))["Names"]
+    body = {name: 1, "model_dump_": 2, "items": [3], "stamp": "2026-10-02"}
+    if to == "pydantic":
+        assert (
+            schema.model_validate(body).model_dump(mode="json", by_alias=True) == body
+        )
+    else:
+        msgspec.inspect.type_info(schema)
+        assert msgspec.to_builtins(msgspec.convert(body, schema)) == body
+
+
+@pytest.mark.parametrize(
+    "choices", [[0.5, 1.5], [True, False], [2**63], [-(2**63) - 1]]
+)
+def test_msgspec_choices_unsupported_by_minimum_version_are_marked(choices):
+    class ChoicesSerializer(serializers.Serializer):
+        value = serializers.ChoiceField(choices=choices)
+
+    text = generate(ChoicesSerializer, "msgspec")
+    assert f"{TODO} these choices are not supported by msgspec Literal" in text
+    schema = load(text)["Choices"]
+    assert msgspec.convert({"value": choices[0]}, schema).value == choices[0]
+
+
+@pytest.mark.parametrize("library", ["pydantic", "msgspec"])
+@pytest.mark.parametrize("pattern", ["^A+$", "^A*$"])
+def test_regex_conversion_preserves_empty_string_validation(library, pattern):
+    from pydantic import create_model
+
+    schema = (
+        create_model("Code", value=(str, Field(pattern=pattern)))
+        if library == "pydantic"
+        else msgspec.defstruct(
+            "Code", [("value", Annotated[str, msgspec.Meta(pattern=pattern)])]
+        )
+    )
+    serializer = load(generate(schema, "drf"))["CodeSerializer"]
+    for value in ("", "A", "B"):
+        expected = re.search(pattern, value) is not None
+        assert serializer(data={"value": value}).is_valid() == expected
+
+
+def test_decimal_precision_differences_are_marked_in_both_directions():
+    from decimal import Decimal
+
+    class Money(BaseModel):
+        value: Decimal = Field(max_digits=4, decimal_places=2)
+
+    class MoneySerializer(serializers.Serializer):
+        value = serializers.DecimalField(max_digits=4, decimal_places=2)
+
+    for text in (generate(Money, "drf"), generate(MoneySerializer, "pydantic")):
+        assert f"{TODO} DRF counts trailing decimal zeros" in text
+        load(text)
+
+
+@pytest.mark.parametrize("to", ["pydantic", "msgspec"])
+@pytest.mark.parametrize("shape", ["list", "dict", "list_dict"])
+def test_nested_containers_keep_input_and_output_schemas_separate(to, shape):
+    from fastdrf.typed import adapt
+
+    class ChildSerializer(serializers.Serializer):
+        command = serializers.CharField(write_only=True)
+        result = serializers.IntegerField(read_only=True)
+
+    child = ChildSerializer()
+    if shape in ("dict", "list_dict"):
+        child = serializers.DictField(child=child)
+    if shape in ("list", "list_dict"):
+        child = serializers.ListField(child=child)
+    source = type("ParentSerializer", (serializers.Serializer,), {"items": child})
+    namespace = load(generate(source, to))
+    assert "ParentIn" in namespace and "ParentOut" in namespace
+    item = {"command": "run", "result": 42}
+    body = {
+        "items": {"a": item}
+        if shape == "dict"
+        else [{"a": item}]
+        if shape == "list_dict"
+        else [item]
+    }
+    assert adapt(namespace["ParentOut"])(body).data == source(body).data
+    incoming = adapt(namespace["ParentIn"])(data=body)
+    assert incoming.is_valid(), incoming.errors
+    assert "result" not in repr(incoming.validated_data)
+
+
+@pytest.mark.parametrize("to", ["pydantic", "msgspec"])
+def test_simple_source_names_are_kept_for_validation_and_output(to):
+    from types import SimpleNamespace
+
+    from fastdrf.typed import adapt
+
+    class RenamedSerializer(serializers.Serializer):
+        display_name = serializers.CharField(source="name")
+
+    schema = load(generate(RenamedSerializer, to))["Renamed"]
+    serializer = adapt(schema)(data={"display_name": "Ada"})
+    assert serializer.is_valid(), serializer.errors
+    assert serializer.validated_data == {"name": "Ada"}
+    assert adapt(schema)(SimpleNamespace(name="Ada")).data == {"display_name": "Ada"}
+
+
+@pytest.mark.parametrize("source", ["owner.name", "*"])
+def test_non_attribute_sources_are_marked(source):
+    class SourceSerializer(serializers.Serializer):
+        value = serializers.CharField(source=source)
+
+    assert f"{TODO} source={source!r} is not converted" in generate(
+        SourceSerializer, "pydantic"
+    )
+
+
+@pytest.mark.parametrize("policy", ["allow", "ignore", "forbid"])
+def test_extra_policies_are_not_silently_lost(policy):
+    from pydantic import ConfigDict, create_model
+
+    schema = create_model(
+        "Extra", __config__=ConfigDict(extra=policy), value=(int, ...)
+    )
+    text = generate(schema, "drf")
+    assert (TODO in text) == (policy != "ignore")
+    assert load(text)["ExtraSerializer"](data={"value": 1}).is_valid()
+
+
+@pytest.mark.parametrize("model_default", [False, True])
+@pytest.mark.parametrize("field_default", [None, False, True])
+def test_default_validation_policy_respects_field_override(
+    model_default, field_default
+):
+    from pydantic import ConfigDict, create_model
+
+    schema = create_model(
+        "Defaults",
+        __config__=ConfigDict(validate_default=model_default),
+        value=(int, Field(default=0, ge=1, validate_default=field_default)),
+    )
+    text = generate(schema, "drf")
+    effective = model_default if field_default is None else field_default
+    assert (f"{TODO} validate_default=True" in text) == effective
+    load(text)
+
+
+def test_patterns_from_another_regex_engine_are_marked():
+    class Letters(BaseModel):
+        value: str = Field(pattern=r"\p{L}+")
+
+    text = generate(Letters, "drf")
+    assert "is not supported by Python re" in text
+    assert load(text)["LettersSerializer"](data={"value": "abc"}).is_valid()

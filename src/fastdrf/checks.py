@@ -10,8 +10,9 @@ server is in the middle of a request.
 from collections.abc import Mapping
 from importlib.util import find_spec
 
+from django.apps import apps
 from django.conf import settings
-from django.core.checks import Error
+from django.core.checks import Error, Info
 from django.core.exceptions import ImproperlyConfigured
 from django.db import models
 
@@ -60,6 +61,39 @@ def check_settings(app_configs, **kwargs):
             )
         )
     return errors
+
+
+#: Packages with fields that a ``fastdrf.contrib`` application registers.
+INTEGRATIONS = {
+    "phonenumber_field": "fastdrf.contrib.phonenumber",
+    "django_countries": "fastdrf.contrib.countries",
+    "djmoney": "fastdrf.contrib.money",
+}
+
+
+def check_integrations(app_configs, **kwargs):
+    """
+    A compiling backend leaves serializers with these packages' fields to
+    DRF unless their ``fastdrf.contrib`` application registers the fields.
+    A package counts when it can be imported (django-phonenumber-field needs
+    no application); only the project's ``SERIALIZER_BACKEND`` is read.
+    """
+    user_settings = getattr(settings, "FASTDRF", {})
+    if (
+        not isinstance(user_settings, Mapping)
+        or user_settings.get("SERIALIZER_BACKEND", "drf") == "drf"
+    ):
+        return []
+    return [
+        Info(
+            f"{package} is installed and its fields are left to DRF by the "
+            "compiled serializer backends.",
+            hint=f"Add {integration!r} to INSTALLED_APPS.",
+            id="fastdrf.I001",
+        )
+        for package, integration in INTEGRATIONS.items()
+        if find_spec(package) is not None and not apps.is_installed(integration)
+    ]
 
 
 def check_serializer_backends(app_configs, **kwargs):

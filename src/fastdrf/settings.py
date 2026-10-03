@@ -17,6 +17,9 @@ DEFAULTS = {
     "SERIALIZER_BACKEND": "drf",
     "SERIALIZER_BACKEND_PARITY": "strict",
     "SERIALIZER_BACKEND_FALLBACK": "drf",
+    # Represent the fields the backend cannot with their own code, in the
+    # compiled output, instead of leaving the serializer to DRF.
+    "DELEGATE_FIELDS": False,
     # The kinds of serializer views may use: "drf" (DRF serializers, compiled
     # or not), "msgspec" and "pydantic" (schema serializers; fastdrf.typed).
     "ALLOWED_SERIALIZER_BACKENDS": ("drf", "msgspec", "pydantic"),
@@ -71,6 +74,7 @@ VALIDATORS = {
     "SERIALIZER_BACKEND": _choice,
     "SERIALIZER_BACKEND_PARITY": _choice,
     "SERIALIZER_BACKEND_FALLBACK": _choice,
+    "DELEGATE_FIELDS": _boolean,
     "ALLOWED_SERIALIZER_BACKENDS": _serializer_kinds,
 }
 

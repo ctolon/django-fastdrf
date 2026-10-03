@@ -23,8 +23,10 @@ install the optional parts:
 
 ```console
 pip install "django-fastdrf[msgspec]"      # msgspec backend, renderer, parser, codec
-pip install "django-fastdrf[pydantic]"     # pydantic backend, schema serializers, codec
+pip install "django-fastdrf[pydantic]"     # pydantic backend, schemas, JSON transport, codec
+pip install "django-fastdrf[orjson]"       # JSON parser and renderer only
 pip install "django-fastdrf[spectacular]"  # OpenAPI for schema serializers
+pip install "django-fastdrf[countries]"    # also money, phonenumber: fastdrf.contrib
 ```
 
 Adding `"fastdrf"` to `INSTALLED_APPS` is optional. It registers system
@@ -81,6 +83,18 @@ python manage.py fastdrf_inspect_serializers
 
 ## Features
 
+[Serializer styles](docs/serializer-styles.md) compares DRF declarations, raw
+Pydantic/msgspec, and schema serializers. For an existing API, follow
+[migrating from DRF serializers](docs/migrating-from-drf.md).
+
+See the [serializer usage examples](docs/serializer-examples.md) for nested
+relations, explicit writes, partial updates, collections, and Pydantic/msgspec
+schemas. The examples include behavior limits and are executed in the test suite.
+Continue with [API views and backend selection](docs/view-examples.md) for
+APIView, generic views, ViewSets, schema endpoints, and backend-specific behavior.
+The [DRF view reference](docs/drf-view-reference.md) covers each view class with
+imports and URL wiring.
+
 Serialization:
 
 - Compiled serializer output with the msgspec, pydantic or dependency-free
@@ -97,6 +111,15 @@ Serialization:
 - Schema serializers: a msgspec `Struct` or a pydantic model as a DRF
   serializer, and `SchemaViewMixin` for views
   ([schema serializers](https://github.com/ctolon/django-fastdrf/blob/main/docs/schema-serializers.md)).
+- Fields of other packages and of the project compiled through
+  `fastdrf.registry`, with integrations for django-phonenumber-field,
+  django-countries and django-money, project-wide msgspec types, and
+  `fastdrf.testing` to check the compiled output against DRF's
+  ([fields of other packages](https://github.com/ctolon/django-fastdrf/blob/main/docs/extending.md)).
+- Delegated fields: `SerializerMethodField`, hyperlinked fields and other
+  fields the backend cannot compile run their own code inside the compiled
+  output (opt-in)
+  ([delegated fields](https://github.com/ctolon/django-fastdrf/blob/main/docs/serializers.md#delegated-fields)).
 
 Queries:
 
@@ -113,8 +136,8 @@ Views and responses:
   releases its request objects when closed, and `DataResponse`, rendered
   without DRF's template response
   ([views and responses](https://github.com/ctolon/django-fastdrf/blob/main/docs/views.md)).
-- A `JSONRenderer` that keeps its encoder, msgspec's JSON renderer and
-  parser, and msgspec and pydantic codecs for Django's Redis cache
+- A `JSONRenderer` that keeps its encoder, msgspec, Pydantic and orjson JSON
+  parsers/renderers, and msgspec and Pydantic codecs for Django's Redis cache
   ([rendering and codecs](https://github.com/ctolon/django-fastdrf/blob/main/docs/rendering.md)).
 
 Tooling:
@@ -136,7 +159,7 @@ Tooling:
 - Synchronous only: no ORM call becomes asynchronous, and transactions,
   authentication, permissions, throttling and pagination are DRF's and
   Django's.
-- Schema serializers, `fast` parity and the msgspec renderer have their own
+- Schema serializers, `fast` parity and the optional JSON renderers have their own
   documented output and validation rules; they are not DRF-identical by
   design.
 - A serializer instance belongs to one request; do not share it between
@@ -156,7 +179,7 @@ differences.
 
 The test suite also runs on free-threaded Python 3.14t (Django 6.1,
 DRF 3.18) and at the declared minimum versions (Django 5.2, DRF 3.16,
-msgspec 0.19, pydantic 2.9). `FETCH_MODE` needs Django 6.1.
+msgspec 0.19, pydantic 2.9, orjson 3.11). `FETCH_MODE` needs Django 6.1.
 
 ## Documentation
 

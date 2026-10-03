@@ -70,16 +70,19 @@ class QueryOptimizationMixin:
         if not isinstance(queryset, models.QuerySet):
             return queryset
         # No serializer to derive lookups from: DRF asks for one only to
-        # build it, and a destroy-only view need not have one.
-        if self.serializer_class is not None or not _framework_only(
-            self, ("get_serializer_class",)
+        # build it, and a destroy-only view need not have one. Asked again
+        # while deriving them (a serializer context that reads the
+        # queryset): DRF's queryset.
+        state = self.__dict__
+        if "_fastdrf_deriving" not in state and (
+            self.serializer_class is not None
+            or not _framework_only(self, ("get_serializer_class",))
         ):
-            serializer_class = self.get_serializer_class()
-            meta = getattr(serializer_class, "Meta", None)
-            if getattr(meta, "auto_prefetch", False) or getattr(meta, "prefetch", None):
-                queryset = auto_prefetch(
-                    queryset, serializer_class, self.get_serializer
-                )
+            state["_fastdrf_deriving"] = True
+            try:
+                queryset = self._optimized(queryset)
+            finally:
+                del state["_fastdrf_deriving"]
         mode = fastdrf_settings.FETCH_MODE
         if mode is not None:
             if not hasattr(queryset, "fetch_mode"):
@@ -87,6 +90,18 @@ class QueryOptimizationMixin:
                     "FETCH_MODE requires Django's queryset fetch_mode API"
                 )
             queryset = queryset.fetch_mode(getattr(models, "FETCH_" + mode.upper()))
+        return queryset
+
+    def _optimized(self, queryset):
+        try:
+            serializer_class = self.get_serializer_class()
+        except Exception:  # noqa: BLE001 -- raised again where DRF asks for it
+            # The project's get_serializer_class() may know only the actions
+            # that serialize (no "destroy"): DRF asks for none there.
+            return queryset
+        meta = getattr(serializer_class, "Meta", None)
+        if getattr(meta, "auto_prefetch", False) or getattr(meta, "prefetch", None):
+            queryset = auto_prefetch(queryset, serializer_class, self.get_serializer)
         return queryset
 
 
@@ -390,7 +405,8 @@ class _HeadersPlan:
         )
         # A handler set on the instance (a viewset's actions) is asked for.
         self.names = frozenset(methods).union(_HEADER_HOOKS, ["http_method_names"])
-        self.names -= {"head"}
+        if hasattr(view_class, "get") or hasattr(view_class, "head"):
+            self.names -= {"head"}
 
 
 _HEADER_DEFINERS = frozenset({RequestPlanMixin, drf_views.APIView, base.View})

@@ -16,7 +16,7 @@ articles.serializers.ArticleSerializer
   output compiled
   input  DRF: ArticleSerializer.price is a DecimalField
 articles.serializers.TagSerializer
-  output compiled
+  output compiled; delegated: url
   input  DRF: TagSerializer.name has a UniqueValidator
 Not inspected:
   GET /reports/: the view chooses its serializer in get_serializer_class()
@@ -27,7 +27,7 @@ Not inspected:
 | `--backend` | `SERIALIZER_BACKEND`, or `msgspec` when that is `drf` | `msgspec`, `pydantic` or `python`. The `python` backend compiles output only. |
 | `--parity` | `SERIALIZER_BACKEND_PARITY` | `strict` or `fast`, for output. |
 | `--serializer` | none | A dotted path to a serializer class. Repeatable. Only these serializers are inspected, and views are not enumerated. |
-| `--format` | `text` | `json` prints one record per serializer, and per endpoint that was not inspected, with an `eligible` flag, a stable `code` and a `reason` for each direction. |
+| `--format` | `text` | `json` prints one record per serializer, and per endpoint that was not inspected, with an `eligible` flag, a stable `code`, a `reason` and the `delegated` fields for each direction. |
 
 Only serializers built on fastdrf's bases (`fastdrf.serializers`) use the
 backend at request time. A serializer that subclasses DRF's classes directly
@@ -89,10 +89,39 @@ becomes `Any` (or `serializers.JSONField()`) with a
 same comments list `validate_<field>()`, `validate()`, validators beyond
 those a field's options build (explicit `validators=`, model validators, the
 unique validators `ModelSerializer` derives), pydantic validators,
-`Annotated` metadata that is not a constraint, and `__post_init__`.
+`Annotated` metadata that is not a constraint, `__post_init__`, and wire
+formats DRF has no equal for: a msgspec tag or `array_like`, and refused
+unknown fields (`forbid_unknown_fields`, pydantic's `extra="forbid"`).
+A literal's constraints choose its choices (`Literal["abc", "abcdef"]` with
+`min_length=5` is the one choice `"abcdef"`), and its `None` member is
+`allow_null`.
 
-The generated classes accept and reject the same canonical JSON input as the
-original, but the libraries coerce differently: DRF accepts `"12"` for an
+Input/output separation also follows serializers inside `ListField` and
+`DictField`. Simple `source="attribute"` mappings keep the Python attribute
+and the wire name separate. Generated Pydantic models with source mappings
+accept both names (`populate_by_name=True`); msgspec uses field renames.
+Names that would shadow generated annotations or Pydantic's model methods
+get internal names with wire aliases. Review these names before wiring a
+generated schema to model writes.
+
+The converter leaves explicit `TODO(convert)` notes for these differences:
+
+- Custom or configured date/time input and output formats, including
+  `format=None`, and patterns Python's regex engine cannot read.
+- Decimal precision checks and output quantization. DRF counts trailing
+  decimal zeros where Pydantic does not; equal option names are not equal rules.
+- Pydantic `extra="allow"` and `validate_default=True`. Plain DRF serializers
+  discard unknown fields and do not validate defaults.
+- Msgspec `omit_defaults=True`; DRF normally represents default values.
+- Non-null DRF `JSONField` converted to `Any`, which accepts null.
+- Msgspec Literal choices other than strings and signed 64-bit integers. These use `Any`
+  with a note so the generated class works on every supported msgspec version.
+- Dotted, `source="*"`, and shared source mappings that cannot be represented
+  by independent schema attributes.
+
+These notes describe work still needed, not generated validators. Resolve
+them before treating the result as a drop-in replacement. Even for converted
+options, the libraries coerce differently: DRF accepts `"12"` for an
 integer and strips whitespace from `CharField` values, strict msgspec does
 neither. Review the output before using it, for example with
 `MsgspecSerializer` or `PydanticSerializer`.

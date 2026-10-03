@@ -5,7 +5,7 @@ from collections.abc import Callable
 
 import pydantic
 
-from fastdrf.compiler import Encoder, OutputSpec, related_items
+from fastdrf.compiler import Encoder, OutputSpec, UnreadableValue, related_items
 
 __all__ = ["build", "model_for"]
 
@@ -51,14 +51,44 @@ def _items(value: typing.Any) -> list[typing.Any]:
     return list(related_items(value))
 
 
+class _Raised(Exception):  # noqa: N818 -- carries another exception
+    """
+    An error of a representation, carried through pydantic, which would make
+    a ``ValueError`` or ``AssertionError`` a ``ValidationError``: the source
+    would then look unreadable and DRF would represent it again, running the
+    representation twice.
+    """
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__(error)
+        self.error = error
+
+
 def _unless_none(
     convert: Callable[[typing.Any], typing.Any],
 ) -> Callable[[typing.Any], typing.Any]:
     # DRF represents None as None without asking the field.
     def validate(value: typing.Any) -> typing.Any:
-        return None if value is None else convert(value)
+        if value is None:
+            return None
+        try:
+            return convert(value)
+        except UnreadableValue:
+            raise
+        except (ValueError, AssertionError) as exc:
+            raise _Raised(exc) from None
 
     return validate
+
+
+def _unwrapped(dump: Callable[[typing.Any], typing.Any]) -> Callable[..., typing.Any]:
+    def run(source: typing.Any) -> typing.Any:
+        try:
+            return dump(source)
+        except _Raised as carried:
+            raise carried.error from None
+
+    return run
 
 
 def build(spec: OutputSpec) -> Encoder:
@@ -77,4 +107,6 @@ def build(spec: OutputSpec) -> Encoder:
             by_alias=True,
         )
 
-    return Encoder(model, dump, dump_many, pydantic.ValidationError)
+    return Encoder(
+        model, _unwrapped(dump), _unwrapped(dump_many), pydantic.ValidationError
+    )
